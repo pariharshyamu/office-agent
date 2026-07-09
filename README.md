@@ -78,15 +78,20 @@ Always quote paths containing brackets (`'/slide[1]'`) — shells glob-expand `[
 
 ```
 create <file> [--force]                          blank .docx/.xlsx/.pptx
-view <file> [outline|text|stats] [--json]        inspect
+view <file> [outline|text|stats|html] [-o FILE]  inspect (html = static snapshot)
 get <file> <path> [--depth N] [--json]           read an element
+query <file> <selector> [--json]                 CSS-like element search
 add <file> <parent> --type T [--prop k=v ...]    add an element
     [--index N | --before PATH | --after PATH]
 set <file> <path> [--prop k=v ...] [--json]      modify properties
     [--find TEXT [--replace TEXT]]               find/format or find/replace
+move <file> <path> [--to P] [--index N|...]      reposition an element
+swap <file> <path1> <path2>                      exchange two elements
 remove <file> <path> [--json]                    delete an element
+dump <file>                                      replayable batch JSON
 batch <file> [--commands JSON | --input F]       many ops, one save cycle
 validate <file> [--json]                         package sanity check
+mcp                                              MCP server on stdio
 help [docx|xlsx|pptx]                            agent-oriented guide
 ```
 
@@ -115,6 +120,79 @@ officecli set doc.docx / --find '\d+%' --prop regex=true --replace "N%"
 Matches work **across run boundaries** in docx and pptx; formatting matched
 text (`--find` + format props without `--replace`) splits runs at match
 boundaries and is docx-only. xlsx replaces within string cells.
+
+### Query
+
+CSS-like selectors matched against the document tree. Predicates test the
+attributes shown by `get` (or the node text via `value`/`text`):
+
+```bash
+officecli query report.docx 'paragraph[style=Normal] > run[font!=Arial]'
+officecli query report.docx 'run[bold=true]'
+officecli query data.xlsx 'cell[value>5000]'
+officecli query deck.pptx ':contains("Revenue")'
+```
+
+Operators: `=`, `!=`, `~=` (substring), `>=`, `<=`, `>`, `<` (numeric when
+both sides are numbers); pseudo-classes `:contains("text")` and `:empty`;
+`a > b` chains direct parent/child.
+
+### Move / swap
+
+```bash
+officecli move report.docx '/body/p[5]' --index 0      # reorder paragraphs
+officecli move deck.pptx '/slide[3]' --before '/slide[1]'
+officecli move data.xlsx '/Summary' --index 0          # reorder sheets
+officecli swap deck.pptx '/slide[1]' '/slide[2]'
+officecli swap report.docx '/body/p[1]' '/body/p[2]'
+```
+
+### Images
+
+```bash
+officecli add report.docx /body --type image --prop src=chart.png --prop align=center
+officecli add deck.pptx '/slide[1]' --type image \
+    --prop src=logo.png --prop x=6in --prop y=0.5in --prop w=2in
+```
+
+PNG, JPEG, and GIF; intrinsic size is read from the file (96 dpi) and the
+aspect ratio is preserved when only one of `w`/`h` is given.
+
+### view html and dump
+
+`view html` renders a static, self-contained HTML snapshot — styled
+paragraphs and tables for docx, grids for xlsx, and absolutely-positioned
+slide canvases (with backgrounds, fonts, colors) for pptx — giving agents a
+render-look-fix loop without a browser engine:
+
+```bash
+officecli view deck.pptx html -o deck.html
+```
+
+`dump` emits a replayable batch-JSON approximation of the content
+(paragraph/table text and styles, cell values and formulas, slides and
+textboxes) that `batch` can apply to a fresh file:
+
+```bash
+officecli dump deck.pptx > ops.json
+officecli create copy.pptx
+officecli batch copy.pptx --input ops.json
+```
+
+### MCP server
+
+`officecli mcp` runs a Model Context Protocol server on stdio, exposing a
+single `officecli` tool whose one argument is the CLI command string —
+the same design as upstream. Register it with any MCP client, e.g. for
+Claude Code:
+
+```bash
+claude mcp add officecli -- /path/to/officecli mcp
+```
+
+```json
+{ "mcpServers": { "officecli": { "command": "/path/to/officecli", "args": ["mcp"] } } }
+```
 
 ### Batch
 
@@ -160,10 +238,11 @@ Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
 ## Known limitations vs upstream OfficeCLI
 
 This is a focused port, not a feature-complete clone. Not (yet) implemented:
-HTML/PNG rendering (`view html`/`screenshot`/`watch`), resident mode,
-MCP server, charts, images, pivot tables, comments/footnotes/TOC/fields,
-animations/transitions, `query` CSS selectors, `move`/`swap`/`dump`,
-plugins, and formula-reference rewriting when xlsx rows shift. The
+PNG rendering (`view screenshot`) and the live `watch` preview server
+(`view html` provides static snapshots), resident mode, charts, pivot
+tables, comments/footnotes/TOC/fields, animations/transitions, plugins,
+column-shift formula rewriting (row shifts are rewritten), and `dump` is a
+content-level approximation rather than a full-fidelity round-trip. The
 architecture (lossless XML DOM over the zip package, one handler per
 format behind a common trait) is designed so these can be added
 incrementally.
@@ -172,17 +251,22 @@ incrementally.
 
 ```
 src/
-  main.rs       clap CLI, dispatch
+  main.rs       clap CLI, dispatch (shared with the MCP server)
   handler.rs    Handler trait implemented by the three formats
   pkg.rs        OOXML zip package (parts held in memory, saved atomically)
   xml.rs        minimal lossless XML DOM (quick-xml based, order-preserving)
   path.rs       /slide[1]/shape[@name=X] path parser + A1 cell refs
   props.rs      --prop parsing, lengths→EMU, colors, alignment
   out.rs        text + JSON report rendering
+  query.rs      CSS-like selector parser + NodeInfo-tree matcher
+  media.rs      image sniffing (PNG/JPEG/GIF) + package bookkeeping
+  html.rs       escaping + page shell for `view html`
+  mcp.rs        Model Context Protocol server (stdio JSON-RPC)
   templates.rs  minimal valid blank .docx/.xlsx/.pptx packages
   docx.rs       Word handler (incl. cross-run find/replace + run splitting)
-  xlsx.rs       Excel handler (incl. shared strings + styles manager)
-  pptx.rs       PowerPoint handler (slides/shapes/relationship bookkeeping)
+  xlsx.rs       Excel handler (incl. shared strings, styles manager,
+                formula-reference rewriting on row shifts)
+  pptx.rs       PowerPoint handler (slides/shapes/images/relationships)
   batch.rs      JSON batch runner
   helptext.rs   `officecli help` agent guide
 ```

@@ -274,3 +274,198 @@ fn files_are_valid_zip_packages() {
     }
     fails(&dir, &["create", "a.txt"]);
 }
+
+#[test]
+fn query_selectors() {
+    let dir = temp_dir("query");
+    ok(&dir, &["create", "doc.docx"]);
+    ok(&dir, &[
+        "add", "doc.docx", "/body", "--type", "paragraph",
+        "--prop", "text=Bold intro", "--prop", "bold=true",
+    ]);
+    ok(&dir, &["add", "doc.docx", "/body", "--type", "paragraph", "--prop", "text=Plain body"]);
+
+    let hits = ok(&dir, &["query", "doc.docx", "run[bold=true]"]);
+    assert!(hits.contains("Bold intro"), "{hits}");
+    assert!(!hits.contains("Plain body"), "{hits}");
+
+    let hits = ok(&dir, &["query", "doc.docx", r#":contains("Plain")"#]);
+    assert!(hits.contains("Plain body"), "{hits}");
+
+    ok(&dir, &["create", "d.xlsx"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A1", "--prop", "value=150"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A2", "--prop", "value=50"]);
+    let hits = ok(&dir, &["query", "d.xlsx", "cell[value>100]"]);
+    assert!(hits.contains("150") && !hits.contains("\"50\""), "{hits}");
+
+    // Chained parent > child.
+    let hits = ok(&dir, &["query", "doc.docx", "paragraph > run[bold=true]"]);
+    assert!(hits.contains("Bold intro"), "{hits}");
+}
+
+#[test]
+fn move_and_swap() {
+    let dir = temp_dir("moveswap");
+    ok(&dir, &["create", "doc.docx"]);
+    for text in ["One", "Two", "Three"] {
+        ok(&dir, &[
+            "add", "doc.docx", "/body", "--type", "paragraph",
+            "--prop", &format!("text={text}"),
+        ]);
+    }
+    ok(&dir, &["move", "doc.docx", "/body/p[3]", "--index", "0"]);
+    let text = ok(&dir, &["view", "doc.docx", "text"]);
+    assert!(text.starts_with("Three"), "{text}");
+    ok(&dir, &["swap", "doc.docx", "/body/p[1]", "/body/p[2]"]);
+    let text = ok(&dir, &["view", "doc.docx", "text"]);
+    assert!(text.starts_with("One\nThree"), "{text}");
+
+    // pptx slide reorder.
+    ok(&dir, &["create", "deck.pptx"]);
+    for title in ["A", "B", "C"] {
+        ok(&dir, &[
+            "add", "deck.pptx", "/", "--type", "slide",
+            "--prop", &format!("title={title}"),
+        ]);
+    }
+    ok(&dir, &["move", "deck.pptx", "/slide[3]", "--index", "0"]);
+    let outline = ok(&dir, &["view", "deck.pptx", "outline"]);
+    assert!(outline.contains("Slide 1: C"), "{outline}");
+    ok(&dir, &["swap", "deck.pptx", "/slide[2]", "/slide[3]"]);
+    let outline = ok(&dir, &["view", "deck.pptx", "outline"]);
+    assert!(outline.contains("Slide 2: B"), "{outline}");
+
+    // xlsx sheet reorder.
+    ok(&dir, &["create", "wb.xlsx"]);
+    ok(&dir, &["add", "wb.xlsx", "/", "--type", "sheet", "--prop", "name=Alpha"]);
+    ok(&dir, &["move", "wb.xlsx", "/Alpha", "--index", "0"]);
+    let outline = ok(&dir, &["view", "wb.xlsx", "outline"]);
+    assert!(outline.contains("Sheet 1: Alpha"), "{outline}");
+}
+
+#[test]
+fn images_embed() {
+    let dir = temp_dir("images");
+    // Minimal 4x3 PNG (header only is enough for sniffing, but write a
+    // complete file so downstream tools can parse it if they want).
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&4u32.to_be_bytes());
+    png.extend_from_slice(&3u32.to_be_bytes());
+    png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(dir.join("img.png"), &png).unwrap();
+
+    ok(&dir, &["create", "doc.docx"]);
+    ok(&dir, &["add", "doc.docx", "/body", "--type", "image", "--prop", "src=img.png"]);
+    ok(&dir, &["create", "deck.pptx"]);
+    ok(&dir, &["add", "deck.pptx", "/", "--type", "slide"]);
+    let out = ok(&dir, &[
+        "add", "deck.pptx", "/slide[1]", "--type", "image",
+        "--prop", "src=img.png", "--prop", "w=2in",
+    ]);
+    // 2in wide, 4:3 intrinsic → h = 1.5in = 1371600 EMU.
+    assert!(out.contains("w=1828800"), "{out}");
+    assert!(out.contains("h=1371600"), "{out}");
+
+    // Media parts + relationships present.
+    let bytes = std::fs::read(dir.join("deck.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("ppt/media/image1.png").is_ok());
+    let bytes = std::fs::read(dir.join("doc.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("word/media/image1.png").is_ok());
+}
+
+#[test]
+fn formula_refs_follow_row_shifts() {
+    let dir = temp_dir("formulas");
+    ok(&dir, &["create", "c.xlsx"]);
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A1", "--prop", "value=10"]);
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A2", "--prop", "value=20"]);
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A3", "--prop", "value==SUM(A1:A2)"]);
+
+    ok(&dir, &["add", "c.xlsx", "/Sheet1", "--type", "row", "--index", "2", "--prop", "values=5"]);
+    let cell = ok(&dir, &["get", "c.xlsx", "/Sheet1/A4", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&cell).unwrap();
+    assert_eq!(v["data"]["results"][0]["attributes"]["formula"], "=SUM(A1:A3)");
+
+    ok(&dir, &["remove", "c.xlsx", "/Sheet1/row[2]"]);
+    let cell = ok(&dir, &["get", "c.xlsx", "/Sheet1/A3", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&cell).unwrap();
+    assert_eq!(v["data"]["results"][0]["attributes"]["formula"], "=SUM(A1:A2)");
+}
+
+#[test]
+fn html_views_and_dump_roundtrip() {
+    let dir = temp_dir("htmldump");
+    ok(&dir, &["create", "deck.pptx"]);
+    ok(&dir, &[
+        "add", "deck.pptx", "/", "--type", "slide",
+        "--prop", "title=Round Trip", "--prop", "background=222222",
+    ]);
+    let html = ok(&dir, &["view", "deck.pptx", "html"]);
+    assert!(html.contains("<!DOCTYPE html>") && html.contains("Round Trip"), "{html}");
+    assert!(html.contains("background:#222222"), "{html}");
+
+    ok(&dir, &["view", "deck.pptx", "html", "-o", "deck.html"]);
+    assert!(dir.join("deck.html").exists());
+
+    // dump → batch into a fresh file reproduces the outline.
+    let ops = ok(&dir, &["dump", "deck.pptx"]);
+    std::fs::write(dir.join("ops.json"), &ops).unwrap();
+    ok(&dir, &["create", "copy.pptx"]);
+    ok(&dir, &["batch", "copy.pptx", "--input", "ops.json"]);
+    let outline = ok(&dir, &["view", "copy.pptx", "outline"]);
+    assert!(outline.contains("Slide 1: Round Trip"), "{outline}");
+
+    // docx html renders headings and formatting.
+    ok(&dir, &["create", "doc.docx"]);
+    ok(&dir, &[
+        "add", "doc.docx", "/body", "--type", "paragraph",
+        "--prop", "text=Head", "--prop", "style=Heading1",
+    ]);
+    let html = ok(&dir, &["view", "doc.docx", "html"]);
+    assert!(html.contains("<h1>Head</h1>"), "{html}");
+}
+
+#[test]
+fn mcp_server_protocol() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = temp_dir("mcp");
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"officecli","arguments":{{"command":"create t.docx"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"officecli","arguments":{{"command":"get t.docx /body/p[9]"}}}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "one response per request (not notification)");
+    assert_eq!(lines[0]["result"]["serverInfo"]["name"], "officecli");
+    assert_eq!(lines[1]["result"]["tools"][0]["name"], "officecli");
+    assert_eq!(lines[2]["result"]["isError"], false);
+    assert_eq!(lines[3]["result"]["isError"], true);
+    assert!(dir.join("t.docx").exists());
+}

@@ -26,7 +26,15 @@ struct Slide {
     part: String,
     rid: String,
     xml: XmlElement,
+    /// The slide's own relationship part (layout, images, ...).
+    rels: XmlElement,
 }
+
+fn slide_rels_part(slide_part: &str) -> String {
+    slide_part.replace("ppt/slides/", "ppt/slides/_rels/") + ".rels"
+}
+
+const EMPTY_RELS: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
 
 pub struct Pptx {
     pkg: Package,
@@ -55,7 +63,18 @@ impl Pptx {
                     .with_context(|| format!("no presentation relationship '{rid}'"))?;
                 let part = resolve_target("ppt", target);
                 let xml = pkg.xml(&part)?;
-                slides.push(Slide { part, rid, xml });
+                let rels_part = slide_rels_part(&part);
+                let slide_rels = if pkg.has_part(&rels_part) {
+                    pkg.xml(&rels_part)?
+                } else {
+                    crate::xml::parse(EMPTY_RELS.as_bytes())?
+                };
+                slides.push(Slide {
+                    part,
+                    rid,
+                    xml,
+                    rels: slide_rels,
+                });
             }
         }
         Ok(Pptx {
@@ -371,6 +390,7 @@ impl Pptx {
         self.pkg.put_xml(CONTENT_TYPES_PART, &ct)?;
         self.pkg
             .put_raw(&rels_part, PPTX_SLIDE_RELS.as_bytes().to_vec());
+        let slide_rels = crate::xml::parse(PPTX_SLIDE_RELS.as_bytes())?;
 
         let mut xml = crate::xml::parse(pptx_blank_slide().as_bytes())?;
 
@@ -383,6 +403,7 @@ impl Pptx {
             part,
             rid,
             xml,
+            rels: slide_rels,
         };
         // Position in self.slides mirrors sldIdLst order: count sldId
         // entries before insert_at.
@@ -613,7 +634,48 @@ impl Handler for Pptx {
                     }),
                 })
             }
-            other => bail!("unknown view mode '{other}' for pptx (text/outline/stats)"),
+            "html" => {
+                // Render at 960px wide; 12192000 EMU (16:9 default) → 960px,
+                // which conveniently makes font px = a:rPr sz / 100.
+                let (sld_cx, sld_cy) = self
+                    .presentation
+                    .child("sldSz")
+                    .and_then(|s| {
+                        Some((
+                            s.attr_local("cx")?.parse::<f64>().ok()?,
+                            s.attr_local("cy")?.parse::<f64>().ok()?,
+                        ))
+                    })
+                    .unwrap_or((12_192_000.0, 6_858_000.0));
+                let scale = 960.0 / sld_cx;
+                let slide_h = (sld_cy * scale).round() as i64;
+                let mut out = String::new();
+                for (i, slide) in self.slides.iter().enumerate() {
+                    out.push_str(&format!("<div class=\"slide-label\">Slide {}</div>\n", i + 1));
+                    let bg = slide
+                        .xml
+                        .child("cSld")
+                        .and_then(|c| c.child("bg"))
+                        .and_then(|bg| bg.child("bgPr"))
+                        .and_then(|p| p.child("solidFill"))
+                        .and_then(|f| f.child("srgbClr"))
+                        .and_then(|c| c.attr_local("val"));
+                    let bg_css = bg
+                        .map(|c| format!("background:#{c};"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "<div class=\"slide\" style=\"width:960px;height:{slide_h}px;{bg_css}\">\n"
+                    ));
+                    let tree = Self::sp_tree(slide)?;
+                    for &si in &Self::shape_indices(tree) {
+                        let e = tree.children[si].as_element().unwrap();
+                        render_shape_html(e, scale, &mut out);
+                    }
+                    out.push_str("</div>\n");
+                }
+                Ok(Report::Text(crate::html::page("Presentation", &out)))
+            }
+            other => bail!("unknown view mode '{other}' for pptx (text/outline/stats/html)"),
         }
     }
 
@@ -686,7 +748,89 @@ impl Handler for Pptx {
                 let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, position);
                 Ok(Report::Nodes(vec![self.shape_info(e, &spath)]))
             }
-            other => bail!("unsupported pptx element type '{other}' (slide/shape)"),
+            "image" | "picture" => {
+                if dpath.segments.is_empty() {
+                    bail!("images are added to a slide: officecli add file.pptx '/slide[1]' --type image --prop src=...");
+                }
+                let slide_idx = self.slide_index(&dpath.segments[0])?;
+                let src = props
+                    .get("src")
+                    .context("image needs --prop src=path/to/file.png")?;
+                let image = crate::media::load_image(src)?;
+                let part = crate::media::store_image(&mut self.pkg, "ppt/media", &image)?;
+                let target = format!("../media/{}", part.rsplit('/').next().unwrap());
+                let rid = crate::media::add_relationship(
+                    &mut self.slides[slide_idx].rels,
+                    crate::media::IMAGE_REL_TYPE,
+                    &target,
+                );
+                let x = props.get("x").map(parse_emu).transpose()?.unwrap_or(914_400);
+                let y = props.get("y").map(parse_emu).transpose()?.unwrap_or(914_400);
+                let w = props
+                    .get("w")
+                    .or_else(|| props.get("width"))
+                    .map(parse_emu)
+                    .transpose()?
+                    .unwrap_or(image.width_emu);
+                let h = match props
+                    .get("h")
+                    .or_else(|| props.get("height"))
+                    .map(parse_emu)
+                    .transpose()?
+                {
+                    Some(h) => h,
+                    None if w != image.width_emu && image.width_emu > 0 => {
+                        image.height_emu * w / image.width_emu
+                    }
+                    None => image.height_emu,
+                };
+                let tree = Self::sp_tree(&self.slides[slide_idx])?;
+                let id = Self::next_shape_id(tree);
+                let name = props
+                    .get("name")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("Picture {id}"));
+
+                let mut pic = XmlElement::new("p:pic");
+                let mut nv = XmlElement::new("p:nvPicPr");
+                nv.push(el(
+                    "p:cNvPr",
+                    &[("id", id.to_string().as_str()), ("name", name.as_str())],
+                ));
+                nv.push(XmlElement::new("p:cNvPicPr"));
+                nv.push(XmlElement::new("p:nvPr"));
+                pic.push(nv);
+                let mut fill = XmlElement::new("p:blipFill");
+                fill.push(el("a:blip", &[("r:embed", rid.as_str())]));
+                let mut stretch = XmlElement::new("a:stretch");
+                stretch.push(XmlElement::new("a:fillRect"));
+                fill.push(stretch);
+                pic.push(fill);
+                let mut sppr = XmlElement::new("p:spPr");
+                let mut xfrm = XmlElement::new("a:xfrm");
+                xfrm.push(el(
+                    "a:off",
+                    &[("x", x.to_string().as_str()), ("y", y.to_string().as_str())],
+                ));
+                xfrm.push(el(
+                    "a:ext",
+                    &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+                ));
+                sppr.push(xfrm);
+                let mut geom = el("a:prstGeom", &[("prst", "rect")]);
+                geom.push(XmlElement::new("a:avLst"));
+                sppr.push(geom);
+                pic.push(sppr);
+
+                let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
+                tree.push(pic);
+                let tree = Self::sp_tree(&self.slides[slide_idx])?;
+                let shape_idxs = Self::shape_indices(tree);
+                let e = tree.children[*shape_idxs.last().unwrap()].as_element().unwrap();
+                let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, shape_idxs.len());
+                Ok(Report::Nodes(vec![self.shape_info(e, &spath)]))
+            }
+            other => bail!("unsupported pptx element type '{other}' (slide/shape/image)"),
         }
     }
 
@@ -919,14 +1063,308 @@ impl Handler for Pptx {
         self.pkg.put_xml(PRESENTATION_RELS_PART, &self.rels)?;
         for slide in &self.slides {
             self.pkg.put_xml(&slide.part, &slide.xml)?;
+            self.pkg.put_xml(&slide_rels_part(&slide.part), &slide.rels)?;
         }
         self.pkg.save(path)
+    }
+
+    fn tree(&mut self) -> Result<Vec<NodeInfo>> {
+        let mut roots = Vec::new();
+        for i in 0..self.slides.len() {
+            roots.push(self.slide_info(i, 1)?);
+        }
+        Ok(roots)
+    }
+
+    fn move_el(&mut self, path_str: &str, _to: Option<&str>, pos: &Position) -> Result<Report> {
+        let dpath = path::parse(path_str)?;
+        let slide_idx = self.slide_index(&dpath.segments[0])?;
+
+        if dpath.segments.len() == 1 {
+            // Reorder slides.
+            let to = match pos {
+                Position::Index(n) => (*n).min(self.slides.len() - 1),
+                Position::Before(p) | Position::After(p) => {
+                    let anchor =
+                        self.slide_index(&path::parse(p)?.segments[0])? as i64;
+                    let after = matches!(pos, Position::After(_)) as i64;
+                    // Position after removing the source slide.
+                    let mut t = anchor + after;
+                    if (slide_idx as i64) < t {
+                        t -= 1;
+                    }
+                    t.max(0) as usize
+                }
+                Position::Append => self.slides.len() - 1,
+            };
+            let slide = self.slides.remove(slide_idx);
+            let rid = slide.rid.clone();
+            self.slides.insert(to.min(self.slides.len()), slide);
+            // Mirror in sldIdLst.
+            if let Some(lst) = self.presentation.child_mut("sldIdLst") {
+                let from_raw = lst.children.iter().position(|n| {
+                    matches!(n, XmlNode::Element(e)
+                        if e.local_name() == "sldId"
+                            && (e.attr("r:id") == Some(&rid)
+                                || e.attr_local("id") == Some(rid.as_str())))
+                });
+                if let Some(i) = from_raw {
+                    let entry = lst.children.remove(i);
+                    // Raw index of the `to`-th sldId (or end).
+                    let mut seen = 0;
+                    let mut insert_at = lst.children.len();
+                    for (ci, n) in lst.children.iter().enumerate() {
+                        if matches!(n, XmlNode::Element(e) if e.local_name() == "sldId") {
+                            if seen == to {
+                                insert_at = ci;
+                                break;
+                            }
+                            seen += 1;
+                        }
+                    }
+                    lst.children.insert(insert_at, entry);
+                }
+            }
+            return Ok(Report::Data {
+                text: format!("moved slide {} to position {}", slide_idx + 1, to + 1),
+                data: json!({ "moved": format!("/slide[{}]", slide_idx + 1), "position": to + 1 }),
+            });
+        }
+
+        // Reorder a shape within its slide.
+        let shape_child_idx = self.find_shape(slide_idx, &dpath.segments[1])?;
+        let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
+        let node = tree.children.remove(shape_child_idx);
+        let shape_idxs = Self::shape_indices(tree);
+        let insert_at = match pos {
+            Position::Index(n) => shape_idxs
+                .get(*n)
+                .copied()
+                .unwrap_or(tree.children.len()),
+            Position::Append => tree.children.len(),
+            _ => bail!("shape move supports --index N (0-based among shapes)"),
+        };
+        tree.children.insert(insert_at, node);
+        Ok(Report::Data {
+            text: format!("moved shape on slide {}", slide_idx + 1),
+            data: json!({ "moved": path_str }),
+        })
+    }
+
+    fn swap(&mut self, path1: &str, path2: &str) -> Result<Report> {
+        let d1 = path::parse(path1)?;
+        let d2 = path::parse(path2)?;
+        let s1 = self.slide_index(&d1.segments[0])?;
+        let s2 = self.slide_index(&d2.segments[0])?;
+        match (d1.segments.len(), d2.segments.len()) {
+            (1, 1) => {
+                // Swap slides = swap their sldIdLst entries + vec order.
+                self.slides.swap(s1, s2);
+                if let Some(lst) = self.presentation.child_mut("sldIdLst") {
+                    let raw: Vec<usize> = lst
+                        .children
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| {
+                            matches!(n, XmlNode::Element(e) if e.local_name() == "sldId")
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if let (Some(&a), Some(&b)) = (raw.get(s1), raw.get(s2)) {
+                        lst.children.swap(a, b);
+                    }
+                }
+            }
+            (2, 2) => {
+                let c1 = self.find_shape(s1, &d1.segments[1])?;
+                let c2 = self.find_shape(s2, &d2.segments[1])?;
+                if s1 == s2 {
+                    let tree = Self::sp_tree_mut(&mut self.slides[s1])?;
+                    tree.children.swap(c1, c2);
+                } else {
+                    let n1 = Self::sp_tree(&self.slides[s1])?.children[c1].clone();
+                    let n2 = Self::sp_tree(&self.slides[s2])?.children[c2].clone();
+                    Self::sp_tree_mut(&mut self.slides[s1])?.children[c1] = n2;
+                    Self::sp_tree_mut(&mut self.slides[s2])?.children[c2] = n1;
+                }
+            }
+            _ => bail!("swap needs two slides or two shapes, not a mix"),
+        }
+        Ok(Report::Data {
+            text: format!("swapped {path1} and {path2}"),
+            data: json!({ "swapped": [path1, path2] }),
+        })
+    }
+
+    fn dump(&mut self) -> Result<serde_json::Value> {
+        let mut ops = Vec::new();
+        for (i, slide) in self.slides.iter().enumerate() {
+            let mut slide_props = serde_json::Map::new();
+            if let Some(bg_color) = slide
+                .xml
+                .child("cSld")
+                .and_then(|c| c.child("bg"))
+                .and_then(|bg| bg.child("bgPr"))
+                .and_then(|p| p.child("solidFill"))
+                .and_then(|f| f.child("srgbClr"))
+                .and_then(|c| c.attr_local("val"))
+            {
+                slide_props.insert("background".into(), json!(bg_color));
+            }
+            ops.push(json!({
+                "command": "add", "parent": "/", "type": "slide",
+                "props": slide_props,
+            }));
+            let tree = Self::sp_tree(slide)?;
+            for &si in &Self::shape_indices(tree) {
+                let e = tree.children[si].as_element().unwrap();
+                if e.local_name() != "sp" {
+                    continue; // only textboxes are replayable today
+                }
+                let mut props = serde_json::Map::new();
+                props.insert("text".into(), json!(shape_text(e)));
+                if let Some(cnvpr) = shape_cnvpr(e) {
+                    if let Some(name) = cnvpr.attr_local("name") {
+                        props.insert("name".into(), json!(name));
+                    }
+                }
+                if let Some(xfrm) = e.child("spPr").and_then(|sp| sp.child("xfrm")) {
+                    if let Some(off) = xfrm.child("off") {
+                        if let (Some(x), Some(y)) = (off.attr_local("x"), off.attr_local("y")) {
+                            props.insert("x".into(), json!(x));
+                            props.insert("y".into(), json!(y));
+                        }
+                    }
+                    if let Some(ext) = xfrm.child("ext") {
+                        if let (Some(cx), Some(cy)) =
+                            (ext.attr_local("cx"), ext.attr_local("cy"))
+                        {
+                            props.insert("w".into(), json!(cx));
+                            props.insert("h".into(), json!(cy));
+                        }
+                    }
+                }
+                // First run's formatting as a shape-level approximation.
+                if let Some(rpr) = e
+                    .child("txBody")
+                    .and_then(|tx| tx.child("p"))
+                    .and_then(|p| p.child("r"))
+                    .and_then(|r| r.child("rPr"))
+                {
+                    if let Some(sz) = rpr.attr_local("sz") {
+                        if let Ok(hundredths) = sz.parse::<f64>() {
+                            props.insert("size".into(), json!(format!("{}", hundredths / 100.0)));
+                        }
+                    }
+                    if rpr.attr_local("b") == Some("1") {
+                        props.insert("bold".into(), json!("true"));
+                    }
+                    if let Some(color) = rpr
+                        .child("solidFill")
+                        .and_then(|f| f.child("srgbClr"))
+                        .and_then(|c| c.attr_local("val"))
+                    {
+                        props.insert("color".into(), json!(color));
+                    }
+                    if let Some(font) = rpr.child("latin").and_then(|l| l.attr_local("typeface"))
+                    {
+                        props.insert("font".into(), json!(font));
+                    }
+                }
+                ops.push(json!({
+                    "command": "add",
+                    "parent": format!("/slide[{}]", i + 1),
+                    "type": "shape",
+                    "props": props,
+                }));
+            }
+        }
+        Ok(serde_json::Value::Array(ops))
     }
 }
 
 /// New slides live only in memory until save; treat them as present.
 fn slide_is_new(_part: &str) -> bool {
     true
+}
+
+fn render_shape_html(e: &XmlElement, scale: f64, out: &mut String) {
+    let xfrm = e.child("spPr").and_then(|sp| sp.child("xfrm"));
+    let get = |el: Option<&XmlElement>, a: &str| -> f64 {
+        el.and_then(|e| e.attr_local(a))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let x = get(xfrm.and_then(|x| x.child("off")), "x") * scale;
+    let y = get(xfrm.and_then(|x| x.child("off")), "y") * scale;
+    let w = get(xfrm.and_then(|x| x.child("ext")), "cx") * scale;
+    let h = get(xfrm.and_then(|x| x.child("ext")), "cy") * scale;
+    let mut css = format!(
+        "left:{:.0}px;top:{:.0}px;width:{:.0}px;height:{:.0}px;",
+        x, y, w, h
+    );
+    if let Some(fill) = e
+        .child("spPr")
+        .and_then(|sp| sp.child("solidFill"))
+        .and_then(|f| f.child("srgbClr"))
+        .and_then(|c| c.attr_local("val"))
+    {
+        css.push_str(&format!("background:#{fill};"));
+    }
+    out.push_str(&format!("<div class=\"shape\" style=\"{css}\">"));
+    if let Some(tx) = e.child("txBody") {
+        for p in tx.children_named("p") {
+            let algn = p
+                .child("pPr")
+                .and_then(|pr| pr.attr_local("algn"))
+                .unwrap_or("l");
+            let align_css = match algn {
+                "ctr" => "text-align:center;",
+                "r" => "text-align:right;",
+                "just" => "text-align:justify;",
+                _ => "",
+            };
+            out.push_str(&format!("<div style=\"{align_css}\">"));
+            for r in p.children_named("r") {
+                let mut span = String::new();
+                if let Some(rpr) = r.child("rPr") {
+                    if let Some(sz) = rpr.attr_local("sz").and_then(|v| v.parse::<f64>().ok()) {
+                        // At 960px slide width, px ≈ sz/100 (see above).
+                        span.push_str(&format!("font-size:{:.0}px;", sz / 100.0));
+                    }
+                    if rpr.attr_local("b") == Some("1") {
+                        span.push_str("font-weight:bold;");
+                    }
+                    if rpr.attr_local("i") == Some("1") {
+                        span.push_str("font-style:italic;");
+                    }
+                    if let Some(color) = rpr
+                        .child("solidFill")
+                        .and_then(|f| f.child("srgbClr"))
+                        .and_then(|c| c.attr_local("val"))
+                    {
+                        span.push_str(&format!("color:#{color};"));
+                    }
+                    if let Some(font) = rpr.child("latin").and_then(|l| l.attr_local("typeface")) {
+                        span.push_str(&format!("font-family:'{font}';"));
+                    }
+                }
+                let text = r
+                    .child("t")
+                    .map(|t| crate::html::escape(&t.text_content()))
+                    .unwrap_or_default();
+                if span.is_empty() {
+                    out.push_str(&text);
+                } else {
+                    out.push_str(&format!("<span style=\"{span}\">{text}</span>"));
+                }
+            }
+            out.push_str("</div>");
+        }
+    } else if e.local_name() == "pic" {
+        out.push_str("<em style=\"color:#888\">[image]</em>");
+    }
+    out.push_str("</div>\n");
 }
 
 /// Visit every a:p in a subtree.

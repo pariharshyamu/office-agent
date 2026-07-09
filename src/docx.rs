@@ -13,10 +13,12 @@ use crate::pkg::Package;
 use crate::xml::{el, XmlElement, XmlNode};
 
 const DOCUMENT_PART: &str = "word/document.xml";
+const DOC_RELS_PART: &str = "word/_rels/document.xml.rels";
 
 pub struct Docx {
     pkg: Package,
     doc: XmlElement,
+    rels: XmlElement,
 }
 
 /// Map friendly element names to OOXML local names.
@@ -49,7 +51,139 @@ fn friendly_name(local: &str) -> &str {
 impl Docx {
     pub fn new(pkg: Package) -> Result<Docx> {
         let doc = pkg.xml(DOCUMENT_PART)?;
-        Ok(Docx { pkg, doc })
+        let rels = pkg.xml(DOC_RELS_PART)?;
+        Ok(Docx { pkg, doc, rels })
+    }
+
+    fn build_image_paragraph(&mut self, props: &Props) -> Result<XmlElement> {
+        let src = props
+            .get("src")
+            .context("image needs --prop src=path/to/file.png")?;
+        let image = crate::media::load_image(src)?;
+        let part = crate::media::store_image(&mut self.pkg, "word/media", &image)?;
+        let target = part.strip_prefix("word/").unwrap_or(&part).to_string();
+        let rid =
+            crate::media::add_relationship(&mut self.rels, crate::media::IMAGE_REL_TYPE, &target);
+
+        let w = props
+            .get("w")
+            .or_else(|| props.get("width"))
+            .map(crate::props::parse_emu)
+            .transpose()?
+            .unwrap_or(image.width_emu);
+        // Keep aspect ratio when only one dimension is given.
+        let h = match props
+            .get("h")
+            .or_else(|| props.get("height"))
+            .map(crate::props::parse_emu)
+            .transpose()?
+        {
+            Some(h) => h,
+            None if w != image.width_emu && image.width_emu > 0 => {
+                image.height_emu * w / image.width_emu
+            }
+            None => image.height_emu,
+        };
+        let pic_id = self.next_drawing_id();
+        let name = props
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Picture {pic_id}"));
+
+        let mut inline = el(
+            "wp:inline",
+            &[
+                ("distT", "0"),
+                ("distB", "0"),
+                ("distL", "0"),
+                ("distR", "0"),
+                (
+                    "xmlns:wp",
+                    "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+                ),
+            ],
+        );
+        inline.push(el(
+            "wp:extent",
+            &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+        ));
+        inline.push(el(
+            "wp:docPr",
+            &[("id", pic_id.to_string().as_str()), ("name", name.as_str())],
+        ));
+        let mut graphic = el(
+            "a:graphic",
+            &[("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main")],
+        );
+        let mut gdata = el(
+            "a:graphicData",
+            &[("uri", "http://schemas.openxmlformats.org/drawingml/2006/picture")],
+        );
+        let mut pic = el(
+            "pic:pic",
+            &[(
+                "xmlns:pic",
+                "http://schemas.openxmlformats.org/drawingml/2006/picture",
+            )],
+        );
+        let mut nv = XmlElement::new("pic:nvPicPr");
+        nv.push(el(
+            "pic:cNvPr",
+            &[("id", pic_id.to_string().as_str()), ("name", name.as_str())],
+        ));
+        nv.push(XmlElement::new("pic:cNvPicPr"));
+        pic.push(nv);
+        let mut fill = XmlElement::new("pic:blipFill");
+        fill.push(el("a:blip", &[("r:embed", rid.as_str())]));
+        let mut stretch = XmlElement::new("a:stretch");
+        stretch.push(XmlElement::new("a:fillRect"));
+        fill.push(stretch);
+        pic.push(fill);
+        let mut sppr = XmlElement::new("pic:spPr");
+        let mut xfrm = XmlElement::new("a:xfrm");
+        xfrm.push(el("a:off", &[("x", "0"), ("y", "0")]));
+        xfrm.push(el(
+            "a:ext",
+            &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+        ));
+        sppr.push(xfrm);
+        let mut geom = el("a:prstGeom", &[("prst", "rect")]);
+        geom.push(XmlElement::new("a:avLst"));
+        sppr.push(geom);
+        pic.push(sppr);
+        gdata.push(pic);
+        graphic.push(gdata);
+        inline.push(graphic);
+
+        let mut drawing = XmlElement::new("w:drawing");
+        drawing.push(inline);
+        let mut r = XmlElement::new("w:r");
+        r.push(drawing);
+        let mut p = XmlElement::new("w:p");
+        if let Some(align) = props.get("align") {
+            let (jc, _) = parse_align(align)?;
+            let mut ppr = XmlElement::new("w:pPr");
+            ppr.push(el("w:jc", &[("w:val", jc)]));
+            p.push(ppr);
+        }
+        p.push(r);
+        Ok(p)
+    }
+
+    fn next_drawing_id(&self) -> u64 {
+        let mut max_id = 0;
+        fn walk(e: &XmlElement, max_id: &mut u64) {
+            if matches!(e.local_name(), "docPr" | "cNvPr") {
+                if let Some(id) = e.attr_local("id").and_then(|v| v.parse::<u64>().ok()) {
+                    *max_id = (*max_id).max(id);
+                }
+            }
+            for c in e.elements() {
+                walk(c, max_id);
+            }
+        }
+        walk(&self.doc, &mut max_id);
+        max_id + 1
     }
 
     fn body(&self) -> Result<&XmlElement> {
@@ -975,7 +1109,14 @@ impl Handler for Docx {
                     }),
                 })
             }
-            other => bail!("unknown view mode '{other}' for docx (text/outline/stats)"),
+            "html" => {
+                let mut out = String::new();
+                for element in body.elements() {
+                    render_html_block(element, &mut out);
+                }
+                Ok(Report::Text(crate::html::page("Document", &out)))
+            }
+            other => bail!("unknown view mode '{other}' for docx (text/outline/stats/html)"),
         }
     }
 
@@ -1048,8 +1189,14 @@ impl Handler for Docx {
                 p.push(r);
                 p
             }
+            "image" | "picture" => {
+                if !matches!(parent_local.as_str(), "body" | "tc") {
+                    bail!("images can be added to /body or a table cell");
+                }
+                self.build_image_paragraph(props)?
+            }
             other => bail!(
-                "unsupported docx element type '{other}' (paragraph/run/table/row/break)"
+                "unsupported docx element type '{other}' (paragraph/run/table/row/break/image)"
             ),
         };
 
@@ -1188,6 +1335,206 @@ impl Handler for Docx {
 
     fn save(&mut self, path: &Path) -> Result<()> {
         self.pkg.put_xml(DOCUMENT_PART, &self.doc)?;
+        self.pkg.put_xml(DOC_RELS_PART, &self.rels)?;
         self.pkg.save(path)
+    }
+
+    fn tree(&mut self) -> Result<Vec<NodeInfo>> {
+        let body = self.body()?;
+        Ok(vec![self.node_info(body, "/body", 8)])
+    }
+
+    fn move_el(&mut self, path_str: &str, to: Option<&str>, pos: &Position) -> Result<Report> {
+        let indices = self.resolve(&path::parse(path_str)?)?;
+        if indices.is_empty() {
+            bail!("cannot move the document body");
+        }
+        let element = self.node_at(&indices)?.clone();
+        let (src_parent, last) = indices.split_at(indices.len() - 1);
+        self.node_at_mut(src_parent)?.children.remove(last[0]);
+        // Anchors in `pos` are resolved after removal.
+        let dest_parent = match to {
+            Some(p) => self.resolve(&path::parse(p)?)?,
+            None => src_parent.to_vec(),
+        };
+        let new_indices = self.insert_into(&dest_parent, element, pos)?;
+        let display = self.display_path(&new_indices)?;
+        let node = self.node_at(&new_indices)?;
+        let info = self.node_info(node, &display, 0);
+        Ok(Report::Nodes(vec![info]))
+    }
+
+    fn swap(&mut self, path1: &str, path2: &str) -> Result<Report> {
+        let i1 = self.resolve(&path::parse(path1)?)?;
+        let i2 = self.resolve(&path::parse(path2)?)?;
+        if i1.is_empty() || i2.is_empty() {
+            bail!("cannot swap the document body");
+        }
+        if i1.starts_with(&i2) || i2.starts_with(&i1) {
+            bail!("cannot swap an element with its ancestor");
+        }
+        let n1 = self.node_at(&i1)?.clone();
+        let n2 = self.node_at(&i2)?.clone();
+        *self.node_at_mut(&i1)? = n2;
+        *self.node_at_mut(&i2)? = n1;
+        Ok(Report::Data {
+            text: format!("swapped {path1} and {path2}"),
+            data: json!({ "swapped": [path1, path2] }),
+        })
+    }
+
+    fn dump(&mut self) -> Result<serde_json::Value> {
+        let body = self.body()?;
+        let mut ops = Vec::new();
+        let mut tbl_count = 0usize;
+        for element in body.elements() {
+            match element.local_name() {
+                "p" => {
+                    let mut props = serde_json::Map::new();
+                    props.insert("text".into(), json!(paragraph_text(element)));
+                    if let Some(ppr) = element.child("pPr") {
+                        if let Some(style) =
+                            ppr.child("pStyle").and_then(|s| s.attr_local("val"))
+                        {
+                            props.insert("style".into(), json!(style));
+                        }
+                        if let Some(jc) = ppr.child("jc").and_then(|s| s.attr_local("val")) {
+                            props.insert("align".into(), json!(jc));
+                        }
+                    }
+                    // First run's formatting as a paragraph-level approximation.
+                    if let Some(rpr) = element
+                        .elements()
+                        .find(|e| e.local_name() == "r")
+                        .and_then(|r| r.child("rPr"))
+                    {
+                        let mut info = NodeInfo::new("", "run");
+                        describe_rpr(rpr, &mut info);
+                        for (k, v) in info.attributes {
+                            props.insert(k, json!(v));
+                        }
+                    }
+                    ops.push(json!({
+                        "command": "add", "parent": "/body",
+                        "type": "paragraph", "props": props,
+                    }));
+                }
+                "tbl" => {
+                    tbl_count += 1;
+                    let rows = element.children_named("tr");
+                    let cols = rows
+                        .first()
+                        .map(|tr| tr.children_named("tc").len())
+                        .unwrap_or(0);
+                    ops.push(json!({
+                        "command": "add", "parent": "/body", "type": "table",
+                        "props": { "rows": rows.len().to_string(), "cols": cols.to_string() },
+                    }));
+                    for (ri, tr) in rows.iter().enumerate() {
+                        for (ci, tc) in tr.children_named("tc").iter().enumerate() {
+                            let text = tc.text_content();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            ops.push(json!({
+                                "command": "set",
+                                "path": format!("/body/tbl[{}]/tr[{}]/tc[{}]", tbl_count, ri + 1, ci + 1),
+                                "props": { "text": text },
+                            }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(serde_json::Value::Array(ops))
+    }
+}
+
+// -------------------------------------------------------------- html ----
+
+fn render_html_block(element: &XmlElement, out: &mut String) {
+    match element.local_name() {
+        "p" => {
+            let style = element
+                .child("pPr")
+                .and_then(|ppr| ppr.child("pStyle"))
+                .and_then(|s| s.attr_local("val"))
+                .unwrap_or("Normal");
+            let (open, close) = match style {
+                "Title" => ("<h1 class=\"title\">", "</h1>"),
+                "Heading1" => ("<h1>", "</h1>"),
+                "Heading2" => ("<h2>", "</h2>"),
+                "Heading3" => ("<h3>", "</h3>"),
+                _ => ("<p>", "</p>"),
+            };
+            let align = element
+                .child("pPr")
+                .and_then(|ppr| ppr.child("jc"))
+                .and_then(|s| s.attr_local("val"));
+            let open = match align {
+                Some(a) if a != "left" => {
+                    let css = if a == "both" { "justify" } else { a };
+                    open.replace('>', &format!(" style=\"text-align:{css}\">"))
+                }
+                _ => open.to_string(),
+            };
+            out.push_str(&open);
+            for run in element.elements().filter(|e| e.local_name() == "r") {
+                render_html_run(run, out);
+            }
+            out.push_str(close);
+            out.push('\n');
+        }
+        "tbl" => {
+            out.push_str("<table>\n");
+            for tr in element.children_named("tr") {
+                out.push_str("<tr>");
+                for tc in tr.children_named("tc") {
+                    out.push_str("<td>");
+                    for child in tc.elements() {
+                        render_html_block(child, out);
+                    }
+                    out.push_str("</td>");
+                }
+                out.push_str("</tr>\n");
+            }
+            out.push_str("</table>\n");
+        }
+        _ => {}
+    }
+}
+
+fn render_html_run(run: &XmlElement, out: &mut String) {
+    let mut css = String::new();
+    if let Some(rpr) = run.child("rPr") {
+        if rpr.child("b").is_some() {
+            css.push_str("font-weight:bold;");
+        }
+        if rpr.child("i").is_some() {
+            css.push_str("font-style:italic;");
+        }
+        if rpr.child("u").is_some() {
+            css.push_str("text-decoration:underline;");
+        }
+        if let Some(color) = rpr.child("color").and_then(|c| c.attr_local("val")) {
+            if color != "auto" {
+                css.push_str(&format!("color:#{color};"));
+            }
+        }
+        if let Some(sz) = rpr.child("sz").and_then(|s| s.attr_local("val")) {
+            if let Ok(half) = sz.parse::<f64>() {
+                css.push_str(&format!("font-size:{}pt;", half / 2.0));
+            }
+        }
+        if let Some(font) = rpr.child("rFonts").and_then(|f| f.attr_local("ascii")) {
+            css.push_str(&format!("font-family:'{font}';"));
+        }
+    }
+    let text = crate::html::escape(&run_text(run)).replace('\n', "<br>");
+    if css.is_empty() {
+        out.push_str(&text);
+    } else {
+        out.push_str(&format!("<span style=\"{css}\">{text}</span>"));
     }
 }

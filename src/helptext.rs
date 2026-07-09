@@ -12,16 +12,26 @@ Add --json to any command for structured output ({"ok":true,"data":...}).
 
 COMMANDS
   create <file> [--force]                       Create a blank document
-  view <file> [outline|text|stats]              Inspect a document
+  view <file> [outline|text|stats|html] [-o F]  Inspect (html = snapshot file)
   get <file> <path> [--depth N]                 Read an element
+  query <file> <selector>                       CSS-like element search
   add <file> <parent> --type T [--prop k=v ...] Add an element
       [--index N | --before PATH | --after PATH]
   set <file> <path> [--prop k=v ...]            Modify properties
       [--find TEXT [--replace TEXT]]            Find/format or find/replace
+  move <file> <path> [--to P] [--index N|--before P|--after P]
+  swap <file> <path1> <path2>                   Exchange two elements
   remove <file> <path>                          Remove an element
+  dump <file>                                   Replayable batch JSON
   batch <file> [--commands JSON|--input F|stdin] Many ops, one save
   validate <file>                               Check package structure
+  mcp                                           MCP server on stdio
   help [docx|xlsx|pptx]                         Format-specific guide
+
+QUERY SELECTORS
+  paragraph[style=Normal] > run[font!=Arial]    direct-child chain
+  cell[value>5000]   run[bold=true]   :contains("text")   :empty
+  Operators: = != ~= (substring) >= <= > < (numeric when both numeric)
 
 VALUE FORMATS
   Colors      FF0000, #FF0000, red, rgb(255,0,0)
@@ -64,6 +74,8 @@ ADD
   --type table       props: rows, cols (default 2x2)
   --type row         parent must be a table; copies the column count
   --type break       page break
+  --type image       props: src=file.png (PNG/JPEG/GIF), w/h (optional,
+                     aspect kept), align; intrinsic size at 96 dpi
 
 SET
   paragraph          text (replaces runs), style, align, plus run format
@@ -103,7 +115,7 @@ ADD
   --type sheet   props: name          (added at '/')
   --type row     props: values="a,b,c" and/or c1=..., c2=...
                  --index N is the 1-based row number; later rows shift down
-                 (formula references are NOT rewritten on shift)
+                 and formula references are rewritten to follow
 
 REMOVE
   /Sheet1        removes the sheet (refused for the last one)
@@ -130,6 +142,7 @@ ADD
   --type shape   textbox; props: text, x, y, w, h (lengths), size (pt),
                  color, bold, italic, font, align, fill, name
                  '\n' in text starts a new paragraph
+  --type image   props: src=file.png, x, y, w, h (aspect kept)
 
 SET
   slide          background=COLOR

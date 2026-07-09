@@ -234,6 +234,32 @@ impl Xlsx {
         Ok(self.cell_info(sheet, c, &path))
     }
 
+    /// After rows of one sheet shift, update A1-style references in every
+    /// formula of the workbook.
+    fn rewrite_all_formulas(&mut self, target_sheet_idx: usize, from_row: u32, delta: i64) {
+        let target_name = self.sheets[target_sheet_idx].name.clone();
+        for (i, sheet) in self.sheets.iter_mut().enumerate() {
+            let own = i == target_sheet_idx;
+            let Some(sd) = sheet.xml.child_mut("sheetData") else { continue };
+            for row in sd.children.iter_mut() {
+                let XmlNode::Element(row) = row else { continue };
+                for cnode in row.children.iter_mut() {
+                    let XmlNode::Element(c) = cnode else { continue };
+                    if c.local_name() != "c" {
+                        continue;
+                    }
+                    let Some(f) = c.child_mut("f") else { continue };
+                    let old = f.text_content();
+                    let new = rewrite_formula_refs(&old, &target_name, own, from_row, delta);
+                    if new != old {
+                        f.children.clear();
+                        f.push_text(&new);
+                    }
+                }
+            }
+        }
+    }
+
     fn save_sheets(&mut self) -> Result<()> {
         // Ensure recalculation of formulas on open.
         let calc = self.workbook.ensure_child("calcPr", "calcPr", false);
@@ -297,7 +323,7 @@ fn find_row(sheet_data: &XmlElement, row_num: u32) -> Option<&XmlElement> {
         .find(|r| r.attr_local("r").map(|v| v == row_num.to_string()).unwrap_or(false))
 }
 
-fn find_cell<'a>(row: &'a XmlElement, col: u32, row0: u32) -> Option<&'a XmlElement> {
+fn find_cell(row: &XmlElement, col: u32, row0: u32) -> Option<&XmlElement> {
     let target = cell_name(col, row0);
     row.children_named("c")
         .into_iter()
@@ -640,7 +666,39 @@ impl Handler for Xlsx {
                     }),
                 })
             }
-            other => bail!("unknown view mode '{other}' for xlsx (text/outline/stats)"),
+            "html" => {
+                let mut out = String::new();
+                for sheet in &self.sheets {
+                    out.push_str(&format!(
+                        "<h2 class=\"sheet-name\">{}</h2>\n",
+                        crate::html::escape(&sheet.name)
+                    ));
+                    let Some(((c0, r0), (c1, r1))) = Self::used_range(sheet) else {
+                        out.push_str("<p><em>(empty)</em></p>\n");
+                        continue;
+                    };
+                    out.push_str("<table>\n<tr><th></th>");
+                    for c in c0..=c1 {
+                        out.push_str(&format!("<th>{}</th>", col_letters(c)));
+                    }
+                    out.push_str("</tr>\n");
+                    let sd = sheet.xml.child("sheetData").unwrap();
+                    for r in r0..=r1 {
+                        out.push_str(&format!("<tr><th class=\"row-num\">{}</th>", r + 1));
+                        for col in c0..=c1 {
+                            let value = find_row(sd, r + 1)
+                                .and_then(|row| find_cell(row, col, r))
+                                .map(|c| self.cell_display(c).0)
+                                .unwrap_or_default();
+                            out.push_str(&format!("<td>{}</td>", crate::html::escape(&value)));
+                        }
+                        out.push_str("</tr>\n");
+                    }
+                    out.push_str("</table>\n");
+                }
+                Ok(Report::Text(crate::html::page("Workbook", &out)))
+            }
+            other => bail!("unknown view mode '{other}' for xlsx (text/outline/stats/html)"),
         }
     }
 
@@ -856,13 +914,13 @@ impl Handler for Xlsx {
                     bail!("row numbers are 1-based");
                 }
                 // Shift existing rows at or below the insertion point down.
+                let mut needs_shift = false;
                 {
                     let sheet = &mut self.sheets[sheet_idx];
                     let sd = sheet
                         .xml
                         .child_mut("sheetData")
                         .context("worksheet has no <sheetData>")?;
-                    let mut needs_shift = false;
                     for row in sd.children.iter().filter_map(|n| n.as_element()) {
                         if row.local_name() == "row" {
                             if let Some(r) = row.attr_local("r").and_then(|v| v.parse::<u32>().ok()) {
@@ -876,6 +934,9 @@ impl Handler for Xlsx {
                     if needs_shift {
                         shift_rows_down(sd, row_num);
                     }
+                }
+                if needs_shift {
+                    self.rewrite_all_formulas(sheet_idx, row_num, 1);
                 }
                 // Fill values: values="a,b,c" and/or cN=value props.
                 let mut wrote_any = false;
@@ -1086,6 +1147,8 @@ impl Handler for Xlsx {
                 bail!("row {n} has no content in {}", sheet.name);
             }
             shift_rows_up(sd, n);
+            self.rewrite_all_formulas(sheet_idx, n + 1, -1);
+            let sheet = &self.sheets[sheet_idx];
             return Ok(Report::Data {
                 text: format!("removed row {n} from {}", sheet.name),
                 data: json!({ "removed": format!("/{}/row[{}]", sheet.name, n) }),
@@ -1139,6 +1202,230 @@ impl Handler for Xlsx {
     fn save(&mut self, path: &Path) -> Result<()> {
         self.save_sheets()?;
         self.pkg.save(path)
+    }
+
+    fn tree(&mut self) -> Result<Vec<NodeInfo>> {
+        let mut roots = Vec::new();
+        for sheet in &self.sheets {
+            let mut s = NodeInfo::new(format!("/{}", sheet.name), "sheet");
+            s.attr("name", &sheet.name);
+            if let Some(sd) = sheet.xml.child("sheetData") {
+                for row in sd.children_named("row") {
+                    let rnum = row.attr_local("r").unwrap_or("?");
+                    let mut ri =
+                        NodeInfo::new(format!("/{}/row[{}]", sheet.name, rnum), "row");
+                    for c in row.children_named("c") {
+                        let r = c.attr_local("r").unwrap_or("?");
+                        let cpath = format!("/{}/{}", sheet.name, r);
+                        ri.children.push(self.cell_info(sheet, c, &cpath));
+                    }
+                    s.children.push(ri);
+                }
+            }
+            roots.push(s);
+        }
+        Ok(roots)
+    }
+
+    fn move_el(&mut self, path_str: &str, _to: Option<&str>, pos: &Position) -> Result<Report> {
+        let dpath = path::parse(path_str)?;
+        if dpath.segments.len() != 1 {
+            bail!("xlsx move supports reordering sheets only, e.g. move /Sheet2 --index 0");
+        }
+        let from = self.sheet_index(&dpath.segments[0])?;
+        let to = match pos {
+            Position::Index(n) => (*n).min(self.sheets.len() - 1),
+            _ => bail!("xlsx move needs --index N (0-based target position)"),
+        };
+        let sheet = self.sheets.remove(from);
+        let name = sheet.name.clone();
+        self.sheets.insert(to, sheet);
+        // Mirror the order in workbook.xml <sheets>.
+        if let Some(sheets_el) = self.workbook.child_mut("sheets") {
+            let pos_in_children = sheets_el.children.iter().position(|n| {
+                matches!(n, XmlNode::Element(e)
+                    if e.local_name() == "sheet" && e.attr_local("name") == Some(&name))
+            });
+            if let Some(i) = pos_in_children {
+                let entry = sheets_el.children.remove(i);
+                // Find raw child index of the `to`-th sheet element (or end).
+                let mut seen = 0;
+                let mut insert_at = sheets_el.children.len();
+                for (ci, n) in sheets_el.children.iter().enumerate() {
+                    if matches!(n, XmlNode::Element(e) if e.local_name() == "sheet") {
+                        if seen == to {
+                            insert_at = ci;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+                sheets_el.children.insert(insert_at, entry);
+            }
+        }
+        Ok(Report::Data {
+            text: format!("moved sheet '{name}' to position {}", to + 1),
+            data: json!({ "moved": name, "position": to + 1 }),
+        })
+    }
+
+    fn dump(&mut self) -> Result<serde_json::Value> {
+        let mut ops = Vec::new();
+        for (i, sheet) in self.sheets.iter().enumerate() {
+            if i == 0 {
+                if sheet.name != "Sheet1" {
+                    ops.push(json!({
+                        "command": "set", "path": "/Sheet1",
+                        "props": { "name": sheet.name },
+                    }));
+                }
+            } else {
+                ops.push(json!({
+                    "command": "add", "parent": "/", "type": "sheet",
+                    "props": { "name": sheet.name },
+                }));
+            }
+            let Some(sd) = sheet.xml.child("sheetData") else { continue };
+            for row in sd.children_named("row") {
+                for c in row.children_named("c") {
+                    let Some(r) = c.attr_local("r") else { continue };
+                    let mut props = serde_json::Map::new();
+                    if let Some(f) = c.child("f") {
+                        props.insert("value".into(), json!(format!("={}", f.text_content())));
+                    } else {
+                        let (value, typ) = self.cell_display(c);
+                        if value.is_empty() {
+                            continue;
+                        }
+                        props.insert("value".into(), json!(value));
+                        if typ == "string" && value.parse::<f64>().is_ok() {
+                            // Preserve string-typed numerics.
+                            props.insert("type".into(), json!("string"));
+                        }
+                    }
+                    ops.push(json!({
+                        "command": "set",
+                        "path": format!("/{}/{}", sheet.name, r),
+                        "props": props,
+                    }));
+                }
+            }
+        }
+        Ok(serde_json::Value::Array(ops))
+    }
+}
+
+// ------------------------------------------------- formula ref rewrite ----
+
+/// Rewrite A1-style references in `formula` when rows of `target_sheet`
+/// shift by `delta` starting at `from_row` (1-based). `own_sheet` says the
+/// formula lives on the shifted sheet (so unqualified refs shift too).
+fn rewrite_formula_refs(
+    formula: &str,
+    target_sheet: &str,
+    own_sheet: bool,
+    from_row: u32,
+    delta: i64,
+) -> String {
+    // Never touch string literals: split on '"' and only process even
+    // segments ("" escaping just yields extra empty segments, still even).
+    let mut out = String::new();
+    for (i, segment) in formula.split('"').enumerate() {
+        if i > 0 {
+            out.push('"');
+        }
+        if i % 2 == 0 {
+            out.push_str(&rewrite_segment(segment, target_sheet, own_sheet, from_row, delta));
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+fn rewrite_segment(
+    segment: &str,
+    target_sheet: &str,
+    own_sheet: bool,
+    from_row: u32,
+    delta: i64,
+) -> String {
+    // (Sheet! | 'Sheet Name'!)? $?COL $?ROW
+    let re = Regex::new(r"(?:('[^']+'|[A-Za-z0-9_.]+)!)?(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)")
+        .unwrap();
+    let bytes = segment.as_bytes();
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in re.captures_iter(segment) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&segment[last..m.start()]);
+        last = m.end();
+        let matched = m.as_str();
+
+        // Guards: not part of a longer identifier (e.g. LOG10(...)) and not
+        // a function call like A1(...).
+        let prev_ok = m.start() == 0
+            || !(bytes[m.start() - 1].is_ascii_alphanumeric()
+                || bytes[m.start() - 1] == b'_'
+                || bytes[m.start() - 1] == b'$');
+        let next_ok = m.end() >= bytes.len()
+            || !(bytes[m.end()].is_ascii_alphanumeric()
+                || bytes[m.end()] == b'('
+                || bytes[m.end()] == b'_');
+        let sheet_ref = caps.get(1).map(|s| s.as_str().trim_matches('\''));
+        let applies = match sheet_ref {
+            Some(s) => s.eq_ignore_ascii_case(target_sheet),
+            None => own_sheet,
+        };
+        let row: u32 = caps[5].parse().unwrap_or(0);
+        if !prev_ok || !next_ok || !applies || row < from_row || row == 0 {
+            out.push_str(matched);
+            continue;
+        }
+        let new_row = ((row as i64) + delta).max(1);
+        let sheet_part = caps
+            .get(1)
+            .map(|s| format!("{}!", s.as_str()))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}{}{}{}{}",
+            sheet_part, &caps[2], &caps[3], &caps[4], new_row
+        ));
+    }
+    out.push_str(&segment[last..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_formula_refs;
+
+    #[test]
+    fn shifts_own_sheet_refs() {
+        assert_eq!(
+            rewrite_formula_refs("SUM(B2:B10)+A1", "Sheet1", true, 3, 1),
+            "SUM(B2:B11)+A1"
+        );
+        assert_eq!(
+            rewrite_formula_refs("$B$5", "Sheet1", true, 3, -1),
+            "$B$4"
+        );
+    }
+
+    #[test]
+    fn respects_sheet_qualifiers_and_literals() {
+        assert_eq!(
+            rewrite_formula_refs("Sheet2!A5+A5", "Sheet2", false, 1, 1),
+            "Sheet2!A6+A5"
+        );
+        assert_eq!(
+            rewrite_formula_refs("'My Sheet'!A5", "My Sheet", false, 1, 2),
+            "'My Sheet'!A7"
+        );
+        assert_eq!(
+            rewrite_formula_refs("IF(A5>0,\"A5\",LOG10(A5))", "Sheet1", true, 1, 1),
+            "IF(A6>0,\"A5\",LOG10(A6))"
+        );
     }
 }
 
