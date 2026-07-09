@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  # Dispatching on a branch releases that branch's HEAD: the release action
+  # creates the tag via the API (useful where git tag pushes are blocked).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: write
@@ -59,6 +67,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: assets/*
           generate_release_notes: true
           body: |
