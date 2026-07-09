@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: officecli-linux-x64
+            binary: target/release/officecli
+          - os: ubuntu-24.04-arm
+            asset: officecli-linux-arm64
+            binary: target/release/officecli
+          - os: macos-latest
+            asset: officecli-mac-arm64
+            binary: target/release/officecli
+          - os: windows-latest
+            asset: officecli-win-x64.exe
+            binary: target/release/officecli.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Rename binary
+        shell: bash
+        run: cp "${{ matrix.binary }}" "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          body: |
+            officecli — a Rust implementation of OfficeCLI: a command-line
+            Office suite for AI agents. Reads, creates, and edits Word
+            (.docx), Excel (.xlsx), and PowerPoint (.pptx) files as a single
+            static binary — no Microsoft Office, no runtime dependencies.
+
+            **Commands:** create, view (outline/text/stats/html), get, query,
+            add, set (props + find/replace), move, swap, remove, dump, batch,
+            validate, mcp (Model Context Protocol server), help.
+
+            **Install:** download the binary for your platform below, make it
+            executable, and put it on your PATH. Run `officecli help` for the
+            agent-oriented command guide, or register it as an MCP server:
+            `claude mcp add officecli -- /path/to/officecli mcp`
