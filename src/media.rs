@@ -21,8 +21,12 @@ const EMU_PER_PX: i64 = 9_525; // 96 dpi
 pub fn load_image(path: &str) -> Result<Image> {
     let bytes = std::fs::read(Path::new(path))
         .with_context(|| format!("cannot read image file '{path}'"))?;
-    let (extension, content_type, dims) = sniff(&bytes)
-        .with_context(|| format!("'{path}' is not a supported image (PNG/JPEG/GIF)"))?;
+    load_image_bytes(bytes).with_context(|| format!("cannot load image '{path}'"))
+}
+
+pub fn load_image_bytes(bytes: Vec<u8>) -> Result<Image> {
+    let (extension, content_type, dims) =
+        sniff(&bytes).context("not a supported image (PNG/JPEG/GIF)")?;
     let (w, h) = dims.unwrap_or((300, 200));
     Ok(Image {
         bytes,
@@ -31,6 +35,22 @@ pub fn load_image(path: &str) -> Result<Image> {
         width_emu: w as i64 * EMU_PER_PX,
         height_emu: h as i64 * EMU_PER_PX,
     })
+}
+
+/// Resolve `src=path` or `srcdata=BASE64` props into an Image.
+pub fn image_from_props(props: &crate::props::Props) -> Result<Image> {
+    if let Some(data) = props.get("srcdata") {
+        use base64::Engine;
+        let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .context("srcdata is not valid base64")?;
+        return load_image_bytes(bytes).context("srcdata does not decode to a PNG/JPEG/GIF");
+    }
+    let src = props
+        .get("src")
+        .context("image needs --prop src=path/to/file.png (or srcdata=BASE64)")?;
+    load_image(src)
 }
 
 type Sniffed = (&'static str, &'static str, Option<(u32, u32)>);

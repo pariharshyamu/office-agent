@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v0.1.0)"
+        description: "Release tag to create (e.g. v0.2.0)"
         required: true
-        default: "v0.1.0"
+        default: "v0.2.0"
 
 permissions:
   contents: write
@@ -25,29 +25,45 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: officecli-linux-x64
-            binary: target/release/officecli
+            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             asset: officecli-linux-arm64
-            binary: target/release/officecli
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             asset: officecli-mac-arm64
-            binary: target/release/officecli
+            target: aarch64-apple-darwin
+          - os: macos-13
+            asset: officecli-mac-x64
+            target: x86_64-apple-darwin
           - os: windows-latest
             asset: officecli-win-x64.exe
-            binary: target/release/officecli.exe
+            target: x86_64-pc-windows-msvc
+          # Cross-compiled with the MSVC toolchain; tests are skipped
+          # because x64 runners cannot execute ARM64 binaries.
+          - os: windows-latest
+            asset: officecli-win-arm64.exe
+            target: aarch64-pc-windows-msvc
+            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Run tests
-        run: cargo test --release
+        if: ${{ !matrix.cross }}
+        run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         shell: bash
-        run: cp "${{ matrix.binary }}" "${{ matrix.asset }}"
+        run: |
+          src="target/${{ matrix.target }}/release/officecli"
+          [[ "${{ matrix.target }}" == *windows* ]] && src="$src.exe"
+          cp "$src" "${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -60,10 +76,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: assets
           merge-multiple: true
+
+      - name: Attach installer scripts
+        run: cp install.sh install.ps1 assets/
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -77,11 +98,22 @@ jobs:
             (.docx), Excel (.xlsx), and PowerPoint (.pptx) files as a single
             static binary — no Microsoft Office, no runtime dependencies.
 
-            **Commands:** create, view (outline/text/stats/html), get, query,
-            add, set (props + find/replace), move, swap, remove, dump, batch,
-            validate, mcp (Model Context Protocol server), help.
+            **Commands:** create, view (outline/text/stats/html/screenshot),
+            get, query, add (incl. charts, images, comments, footnotes, TOC,
+            pivots), set (props, find/replace, transitions, animations),
+            move, swap, remove, dump, batch, validate, watch (live preview),
+            resident, mcp (Model Context Protocol server), help.
 
-            **Install:** download the binary for your platform below, make it
-            executable, and put it on your PATH. Run `officecli help` for the
-            agent-oriented command guide, or register it as an MCP server:
+            **Install (Linux/macOS):**
+            ```sh
+            curl -fsSL https://github.com/pariharshyamu/office-agent/releases/latest/download/install.sh | sh
+            ```
+            **Install (Windows):**
+            ```powershell
+            irm https://github.com/pariharshyamu/office-agent/releases/latest/download/install.ps1 | iex
+            ```
+            Windows binaries are built with the MSVC toolchain (x64 and ARM64).
+
+            Run `officecli help` for the agent-oriented command guide, or
+            register it as an MCP server:
             `claude mcp add officecli -- /path/to/officecli mcp`

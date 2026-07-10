@@ -87,14 +87,18 @@ impl Report {
         }
     }
 
+    /// The `data` payload of the JSON envelope.
+    pub fn data_value(&self) -> Value {
+        match self {
+            Report::Text(t) => serde_json::json!({ "text": t }),
+            Report::Nodes(nodes) => serde_json::json!({ "results": nodes }),
+            Report::Data { data, .. } => data.clone(),
+        }
+    }
+
     pub fn render(&self, json: bool) -> String {
         if json {
-            let data = match self {
-                Report::Text(t) => serde_json::json!({ "text": t }),
-                Report::Nodes(nodes) => serde_json::json!({ "results": nodes }),
-                Report::Data { data, .. } => data.clone(),
-            };
-            let envelope = serde_json::json!({ "ok": true, "data": data });
+            let envelope = serde_json::json!({ "ok": true, "data": self.data_value() });
             serde_json::to_string_pretty(&envelope).unwrap()
         } else {
             match self {

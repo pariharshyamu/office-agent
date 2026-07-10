@@ -436,6 +436,448 @@ impl Pptx {
         }
         Ok(slide_pos)
     }
+
+    /// Insert a chart as a graphicFrame. Data comes from props
+    /// (categories/values/series, plus values2/series2, ... for more
+    /// series); the chart part stores it as cached literals.
+    fn add_chart(&mut self, slide_idx: usize, props: &Props) -> Result<Report> {
+        let kind = crate::chart::parse_kind(props.get("kind").unwrap_or("column"))?;
+        let cats: Vec<String> = props
+            .get("categories")
+            .or_else(|| props.get("cats"))
+            .map(|c| c.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default();
+        let parse_vals = |raw: &str| -> Result<Vec<f64>> {
+            raw.split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<f64>()
+                        .map_err(|_| anyhow::anyhow!("'{}' is not a number in values", s.trim()))
+                })
+                .collect()
+        };
+        let mut series = Vec::new();
+        let first = props
+            .get("values")
+            .context("chart needs --prop values=10,20,30 (and usually --prop categories=A,B,C)")?;
+        series.push(crate::chart::Series {
+            name: props.get("series").unwrap_or("Series 1").to_string(),
+            cats: cats.clone(),
+            vals: parse_vals(first)?,
+            ..Default::default()
+        });
+        let mut n = 2;
+        while let Some(vals) = props.get(&format!("values{n}")) {
+            series.push(crate::chart::Series {
+                name: props
+                    .get(&format!("series{n}"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("Series {n}")),
+                cats: cats.clone(),
+                vals: parse_vals(vals)?,
+                ..Default::default()
+            });
+            n += 1;
+        }
+        let chart_space = crate::chart::build_chart_space(kind, props.get("title"), &series)?;
+
+        let chart_num = self
+            .pkg
+            .part_names()
+            .filter_map(|p| {
+                p.strip_prefix("ppt/charts/chart")
+                    .and_then(|s| s.strip_suffix(".xml"))
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let chart_part = format!("ppt/charts/chart{chart_num}.xml");
+        self.pkg.put_xml(&chart_part, &chart_space)?;
+        self.pkg
+            .add_override(&chart_part, crate::chart::CHART_CONTENT_TYPE)?;
+        let rid = crate::media::add_relationship(
+            &mut self.slides[slide_idx].rels,
+            crate::chart::CHART_REL_TYPE,
+            &format!("../charts/chart{chart_num}.xml"),
+        );
+
+        let x = props.get("x").map(parse_emu).transpose()?.unwrap_or(914_400);
+        let y = props.get("y").map(parse_emu).transpose()?.unwrap_or(1_371_600);
+        let w = props
+            .get("w")
+            .or_else(|| props.get("width"))
+            .map(parse_emu)
+            .transpose()?
+            .unwrap_or(7_315_200);
+        let h = props
+            .get("h")
+            .or_else(|| props.get("height"))
+            .map(parse_emu)
+            .transpose()?
+            .unwrap_or(4_114_800);
+
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let id = Self::next_shape_id(tree);
+        let name = props
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Chart {chart_num}"));
+
+        let mut frame = XmlElement::new("p:graphicFrame");
+        let mut nv = XmlElement::new("p:nvGraphicFramePr");
+        nv.push(el(
+            "p:cNvPr",
+            &[("id", id.to_string().as_str()), ("name", name.as_str())],
+        ));
+        nv.push(XmlElement::new("p:cNvGraphicFramePr"));
+        nv.push(XmlElement::new("p:nvPr"));
+        frame.push(nv);
+        let mut xfrm = XmlElement::new("p:xfrm");
+        xfrm.push(el(
+            "a:off",
+            &[("x", x.to_string().as_str()), ("y", y.to_string().as_str())],
+        ));
+        xfrm.push(el(
+            "a:ext",
+            &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+        ));
+        frame.push(xfrm);
+        let mut graphic = XmlElement::new("a:graphic");
+        let mut gdata = el(
+            "a:graphicData",
+            &[("uri", "http://schemas.openxmlformats.org/drawingml/2006/chart")],
+        );
+        gdata.push(el(
+            "c:chart",
+            &[
+                ("xmlns:c", "http://schemas.openxmlformats.org/drawingml/2006/chart"),
+                (
+                    "xmlns:r",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                ),
+                ("r:id", rid.as_str()),
+            ],
+        ));
+        graphic.push(gdata);
+        frame.push(graphic);
+
+        let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
+        tree.push(frame);
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let shape_idxs = Self::shape_indices(tree);
+        let e = tree.children[*shape_idxs.last().unwrap()].as_element().unwrap();
+        let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, shape_idxs.len());
+        let mut info = self.shape_info(e, &spath);
+        info.attr("chart", props.get("kind").unwrap_or("column"));
+        info.attr("series", series.len().to_string());
+        Ok(Report::Nodes(vec![info]))
+    }
+}
+
+// -------------------------------------------- transitions / animations ----
+
+/// Insert `child` into a p:sld respecting schema order:
+/// cSld, clrMapOvr, transition, timing.
+fn insert_slide_child(slide_xml: &mut XmlElement, child: XmlElement) {
+    let order = ["cSld", "clrMapOvr", "transition", "timing", "extLst"];
+    let rank = |name: &str| order.iter().position(|o| *o == name).unwrap_or(order.len());
+    let child_rank = rank(child.local_name());
+    let mut at = slide_xml.children.len();
+    for (i, node) in slide_xml.children.iter().enumerate() {
+        if let XmlNode::Element(e) = node {
+            if rank(e.local_name()) > child_rank {
+                at = i;
+                break;
+            }
+        }
+    }
+    slide_xml.children.insert(at, XmlNode::Element(child));
+}
+
+/// Build a `p:transition` from props. Returns None for `transition=none`.
+fn build_transition(props: &Props) -> Result<Option<XmlElement>> {
+    let kind = props.get("transition").unwrap().to_ascii_lowercase();
+    if kind == "none" {
+        return Ok(None);
+    }
+    // element name, dir-attribute style it accepts.
+    let (name, dir_kind): (&str, &str) = match kind.as_str() {
+        "fade" => ("p:fade", ""),
+        "cut" => ("p:cut", ""),
+        "dissolve" => ("p:dissolve", ""),
+        "random" => ("p:random", ""),
+        "circle" => ("p:circle", ""),
+        "diamond" => ("p:diamond", ""),
+        "plus" => ("p:plus", ""),
+        "wedge" => ("p:wedge", ""),
+        "newsflash" => ("p:newsflash", ""),
+        "wheel" => ("p:wheel", ""),
+        "push" => ("p:push", "lrud"),
+        "wipe" => ("p:wipe", "lrud"),
+        "cover" => ("p:cover", "lrud8"),
+        "pull" => ("p:pull", "lrud8"),
+        "zoom" => ("p:zoom", "inout"),
+        "split" => ("p:split", "inout"),
+        "blinds" => ("p:blinds", "hv"),
+        "checker" => ("p:checker", "hv"),
+        "comb" => ("p:comb", "hv"),
+        "strips" => ("p:strips", "corners"),
+        other => bail!(
+            "unknown transition '{other}' (fade/cut/push/wipe/dissolve/circle/diamond/plus/wedge/wheel/zoom/cover/pull/split/blinds/checker/comb/strips/newsflash/random/none)"
+        ),
+    };
+    let mut effect = XmlElement::new(name);
+    if let Some(direction) = props.get("direction") {
+        let d = direction.to_ascii_lowercase();
+        let mapped = match (dir_kind, d.as_str()) {
+            ("lrud", "left") | ("lrud8", "left") => Some("l"),
+            ("lrud", "right") | ("lrud8", "right") => Some("r"),
+            ("lrud", "up") | ("lrud8", "up") => Some("u"),
+            ("lrud", "down") | ("lrud8", "down") => Some("d"),
+            ("hv", "horizontal") => Some("horz"),
+            ("hv", "vertical") => Some("vert"),
+            ("inout", "in") => Some("in"),
+            ("inout", "out") => Some("out"),
+            ("corners", "left-down") => Some("ld"),
+            ("corners", "left-up") => Some("lu"),
+            ("corners", "right-down") => Some("rd"),
+            ("corners", "right-up") => Some("ru"),
+            _ => None,
+        };
+        match mapped {
+            Some(m) => effect.set_attr("dir", m),
+            None => bail!("direction '{direction}' does not apply to transition '{kind}'"),
+        }
+    }
+    let mut transition = XmlElement::new("p:transition");
+    if let Some(speed) = props.get("speed").or_else(|| props.get("duration")) {
+        let spd = match speed.to_ascii_lowercase().as_str() {
+            "slow" => "slow",
+            "medium" | "med" => "med",
+            "fast" => "fast",
+            other => {
+                // A duration is mapped onto PowerPoint's three speeds.
+                let ms = parse_duration_ms(other)?;
+                if ms <= 500 { "fast" } else if ms <= 1000 { "med" } else { "slow" }
+            }
+        };
+        transition.set_attr("spd", spd);
+    }
+    if let Some(advance) = props.get("advance") {
+        let ms = parse_duration_ms(advance)?;
+        transition.set_attr("advTm", &ms.to_string());
+    }
+    transition.push(effect);
+    Ok(Some(transition))
+}
+
+/// "500ms", "1.5s", or bare milliseconds.
+fn parse_duration_ms(v: &str) -> Result<u64> {
+    let v = v.trim();
+    if let Some(s) = v.strip_suffix("ms") {
+        return s.trim().parse().map_err(|_| anyhow::anyhow!("'{v}' is not a duration"));
+    }
+    if let Some(s) = v.strip_suffix('s') {
+        let secs: f64 = s.trim().parse().map_err(|_| anyhow::anyhow!("'{v}' is not a duration"))?;
+        return Ok((secs * 1000.0).round() as u64);
+    }
+    v.parse().map_err(|_| anyhow::anyhow!("'{v}' is not a duration (use 500ms, 1.5s, or milliseconds)"))
+}
+
+fn max_ctn_id(e: &XmlElement) -> u64 {
+    let mut max = 0;
+    if e.local_name() == "cTn" {
+        if let Some(id) = e.attr_local("id").and_then(|v| v.parse::<u64>().ok()) {
+            max = id;
+        }
+    }
+    for c in e.elements() {
+        max = max.max(max_ctn_id(c));
+    }
+    max
+}
+
+fn cond(delay: &str) -> XmlElement {
+    el("p:cond", &[("delay", delay)])
+}
+
+/// Get (creating if needed) the mainSeq childTnLst of the slide's timing tree.
+fn ensure_timing_main_seq(slide_xml: &mut XmlElement) -> Result<&mut XmlElement> {
+    if slide_xml.child("timing").is_none() {
+        let mut timing = XmlElement::new("p:timing");
+        let mut tn_lst = XmlElement::new("p:tnLst");
+        let mut par = XmlElement::new("p:par");
+        let mut root_ctn = el(
+            "p:cTn",
+            &[("id", "1"), ("dur", "indefinite"), ("restart", "never"), ("nodeType", "tmRoot")],
+        );
+        let mut root_children = XmlElement::new("p:childTnLst");
+        let mut seq = el("p:seq", &[("concurrent", "1"), ("nextAc", "seek")]);
+        let mut main_ctn = el(
+            "p:cTn",
+            &[("id", "2"), ("dur", "indefinite"), ("nodeType", "mainSeq")],
+        );
+        main_ctn.push(XmlElement::new("p:childTnLst"));
+        seq.push(main_ctn);
+        let mut prev = XmlElement::new("p:prevCondLst");
+        let mut pc = el("p:cond", &[("evt", "onPrev"), ("delay", "0")]);
+        let mut tgt = XmlElement::new("p:tgtEl");
+        tgt.push(XmlElement::new("p:sldTgt"));
+        pc.push(tgt);
+        prev.push(pc);
+        seq.push(prev);
+        let mut next = XmlElement::new("p:nextCondLst");
+        let mut nc = el("p:cond", &[("evt", "onNext"), ("delay", "0")]);
+        let mut tgt = XmlElement::new("p:tgtEl");
+        tgt.push(XmlElement::new("p:sldTgt"));
+        nc.push(tgt);
+        next.push(nc);
+        seq.push(next);
+        root_children.push(seq);
+        root_ctn.push(root_children);
+        par.push(root_ctn);
+        tn_lst.push(par);
+        timing.push(tn_lst);
+        insert_slide_child(slide_xml, timing);
+    }
+    slide_xml
+        .child_mut("timing")
+        .and_then(|t| t.child_mut("tnLst"))
+        .and_then(|t| t.child_mut("par"))
+        .and_then(|p| p.child_mut("cTn"))
+        .and_then(|c| c.child_mut("childTnLst"))
+        .and_then(|c| c.child_mut("seq"))
+        .and_then(|s| s.child_mut("cTn"))
+        .and_then(|c| c.child_mut("childTnLst"))
+        .context("timing tree has no main sequence (was it created by another tool?)")
+}
+
+fn sp_target(spid: &str) -> XmlElement {
+    let mut tgt = XmlElement::new("p:tgtEl");
+    tgt.push(el("p:spTgt", &[("spid", spid)]));
+    tgt
+}
+
+/// Append one click-triggered entrance effect for shape `spid`.
+fn append_entrance_animation(
+    slide_xml: &mut XmlElement,
+    spid: &str,
+    effect: &str,
+    duration_ms: u64,
+    delay_ms: u64,
+) -> Result<()> {
+    // (presetID, animEffect filter) — appear has no filter behavior.
+    let (preset_id, filter): (u32, Option<String>) = match effect.to_ascii_lowercase().as_str() {
+        "appear" => (1, None),
+        "fade" | "fade-in" | "fadein" => (10, Some("fade".to_string())),
+        "wipe" | "wipe-in" => (22, Some("wipe(bottom)".to_string())),
+        other => bail!("unknown animation '{other}' (appear/fade/wipe)"),
+    };
+    let mut next_id = max_ctn_id(slide_xml.child("timing").unwrap_or(&XmlElement::new("x"))) + 1;
+    if next_id < 3 {
+        next_id = 3;
+    }
+    let main = ensure_timing_main_seq(slide_xml)?;
+    let mut id = max_ctn_id(main).max(next_id - 1) + 1;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v.to_string()
+    };
+
+    // Effect behaviors.
+    let mut behaviors: Vec<XmlElement> = Vec::new();
+    let mut set = XmlElement::new("p:set");
+    let mut cbhvr = XmlElement::new("p:cBhvr");
+    let mut ctn = el("p:cTn", &[("id", "0"), ("dur", "1"), ("fill", "hold")]);
+    let mut st = XmlElement::new("p:stCondLst");
+    st.push(cond("0"));
+    ctn.push(st);
+    cbhvr.push(ctn);
+    cbhvr.push(sp_target(spid));
+    let mut attrs = XmlElement::new("p:attrNameLst");
+    let mut attr = XmlElement::new("p:attrName");
+    attr.push_text("style.visibility");
+    attrs.push(attr);
+    cbhvr.push(attrs);
+    set.push(cbhvr);
+    let mut to = XmlElement::new("p:to");
+    let mut sv = el("p:strVal", &[("val", "visible")]);
+    to.push(std::mem::take(&mut sv));
+    set.push(to);
+    behaviors.push(set);
+    if let Some(filter) = &filter {
+        let mut anim = el(
+            "p:animEffect",
+            &[("transition", "in"), ("filter", filter.as_str())],
+        );
+        let mut cbhvr = XmlElement::new("p:cBhvr");
+        cbhvr.push(el("p:cTn", &[("id", "0"), ("dur", duration_ms.to_string().as_str())]));
+        cbhvr.push(sp_target(spid));
+        anim.push(cbhvr);
+        behaviors.push(anim);
+    }
+
+    // Click group scaffolding, innermost first.
+    let mut effect_ctn = el(
+        "p:cTn",
+        &[
+            ("id", "0"),
+            ("presetID", preset_id.to_string().as_str()),
+            ("presetClass", "entr"),
+            ("presetSubtype", "0"),
+            ("fill", "hold"),
+            ("nodeType", "clickEffect"),
+        ],
+    );
+    let mut st = XmlElement::new("p:stCondLst");
+    st.push(cond(&delay_ms.to_string()));
+    effect_ctn.push(st);
+    let mut children = XmlElement::new("p:childTnLst");
+    for b in behaviors {
+        children.push(b);
+    }
+    effect_ctn.push(children);
+    let mut effect_par = XmlElement::new("p:par");
+    effect_par.push(effect_ctn);
+
+    let mut group_ctn = el("p:cTn", &[("id", "0"), ("fill", "hold")]);
+    let mut st = XmlElement::new("p:stCondLst");
+    st.push(cond("0"));
+    group_ctn.push(st);
+    let mut children = XmlElement::new("p:childTnLst");
+    children.push(effect_par);
+    group_ctn.push(children);
+    let mut group_par = XmlElement::new("p:par");
+    group_par.push(group_ctn);
+
+    let mut click_ctn = el("p:cTn", &[("id", "0"), ("fill", "hold")]);
+    let mut st = XmlElement::new("p:stCondLst");
+    st.push(cond("indefinite"));
+    click_ctn.push(st);
+    let mut children = XmlElement::new("p:childTnLst");
+    children.push(group_par);
+    click_ctn.push(children);
+    let mut click_par = XmlElement::new("p:par");
+    click_par.push(click_ctn);
+
+    // Assign unique ids to every cTn we created (outermost first for
+    // stable numbering).
+    fn assign_ids(e: &mut XmlElement, next: &mut dyn FnMut() -> String) {
+        if e.local_name() == "cTn" && e.attr_local("id") == Some("0") {
+            let id = next();
+            e.set_attr("id", &id);
+        }
+        for c in e.children.iter_mut() {
+            if let XmlNode::Element(ce) = c {
+                assign_ids(ce, next);
+            }
+        }
+    }
+    assign_ids(&mut click_par, &mut next);
+    main.push(click_par);
+    Ok(())
 }
 
 fn shape_cnvpr(e: &XmlElement) -> Option<&XmlElement> {
@@ -753,10 +1195,7 @@ impl Handler for Pptx {
                     bail!("images are added to a slide: officecli add file.pptx '/slide[1]' --type image --prop src=...");
                 }
                 let slide_idx = self.slide_index(&dpath.segments[0])?;
-                let src = props
-                    .get("src")
-                    .context("image needs --prop src=path/to/file.png")?;
-                let image = crate::media::load_image(src)?;
+                let image = crate::media::image_from_props(props)?;
                 let part = crate::media::store_image(&mut self.pkg, "ppt/media", &image)?;
                 let target = format!("../media/{}", part.rsplit('/').next().unwrap());
                 let rid = crate::media::add_relationship(
@@ -830,7 +1269,14 @@ impl Handler for Pptx {
                 let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, shape_idxs.len());
                 Ok(Report::Nodes(vec![self.shape_info(e, &spath)]))
             }
-            other => bail!("unsupported pptx element type '{other}' (slide/shape/image)"),
+            "chart" => {
+                if dpath.segments.is_empty() {
+                    bail!("charts are added to a slide: officecli add file.pptx '/slide[1]' --type chart --prop values=...");
+                }
+                let slide_idx = self.slide_index(&dpath.segments[0])?;
+                self.add_chart(slide_idx, props)
+            }
+            other => bail!("unsupported pptx element type '{other}' (slide/shape/image/chart)"),
         }
     }
 
@@ -871,18 +1317,58 @@ impl Handler for Pptx {
         let slide_idx = self.slide_index(&dpath.segments[0])?;
 
         if dpath.segments.len() == 1 {
+            let mut changed: Vec<String> = Vec::new();
             if let Some(background) = props.get("background") {
                 let color = parse_color(background)?;
                 set_slide_background(&mut self.slides[slide_idx].xml, &color)?;
-                return Ok(Report::Data {
-                    text: format!("set slide {} background to {color}", slide_idx + 1),
-                    data: json!({ "slide": slide_idx + 1, "background": color }),
-                });
+                changed.push(format!("background={color}"));
             }
-            bail!("slide-level set supports --prop background=COLOR");
+            if props.has("transition") {
+                let slide_xml = &mut self.slides[slide_idx].xml;
+                slide_xml.children.retain(|n| {
+                    !matches!(n, XmlNode::Element(e) if e.local_name() == "transition")
+                });
+                if let Some(transition) = build_transition(props)? {
+                    insert_slide_child(slide_xml, transition);
+                }
+                changed.push(format!("transition={}", props.get("transition").unwrap()));
+            }
+            if changed.is_empty() {
+                bail!("slide-level set supports --prop background=COLOR and --prop transition=fade|push|... [--prop direction=..] [--prop speed=..] [--prop advance=..]");
+            }
+            return Ok(Report::Data {
+                text: format!("slide {}: set {}", slide_idx + 1, changed.join(", ")),
+                data: json!({ "slide": slide_idx + 1, "set": changed }),
+            });
         }
 
         let shape_child_idx = self.find_shape(slide_idx, &dpath.segments[1])?;
+
+        // Entrance animation (extends the slide's timing tree).
+        if let Some(effect) = props.get("animation") {
+            let spid = {
+                let tree = Self::sp_tree(&self.slides[slide_idx])?;
+                let e = tree.children[shape_child_idx].as_element().unwrap();
+                shape_cnvpr(e)
+                    .and_then(|c| c.attr_local("id"))
+                    .map(|s| s.to_string())
+                    .context("shape has no stable id to animate")?
+            };
+            let duration = props
+                .get("duration")
+                .map(parse_duration_ms)
+                .transpose()?
+                .unwrap_or(500);
+            let delay = props.get("delay").map(parse_duration_ms).transpose()?.unwrap_or(0);
+            append_entrance_animation(
+                &mut self.slides[slide_idx].xml,
+                &spid,
+                effect,
+                duration,
+                delay,
+            )?;
+        }
+
         let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
         let sp = tree.children[shape_child_idx]
             .as_element_mut()
@@ -1196,6 +1682,142 @@ impl Handler for Pptx {
         })
     }
 
+    fn screenshot(&mut self) -> Result<Vec<Vec<u8>>> {
+        use crate::render::{Canvas, Color, Span, BLACK, MUTED, WHITE};
+        let (sld_cx, sld_cy) = self
+            .presentation
+            .child("sldSz")
+            .and_then(|s| {
+                Some((
+                    s.attr_local("cx")?.parse::<f64>().ok()?,
+                    s.attr_local("cy")?.parse::<f64>().ok()?,
+                ))
+            })
+            .unwrap_or((12_192_000.0, 6_858_000.0));
+        let width = 1280u32;
+        let scale = width as f64 / sld_cx;
+        let height = (sld_cy * scale).round() as u32;
+        let px_per_pt = (scale * 12_700.0) as f32;
+
+        let mut images = Vec::new();
+        for slide in &self.slides {
+            let bg = slide
+                .xml
+                .child("cSld")
+                .and_then(|c| c.child("bg"))
+                .and_then(|bg| bg.child("bgPr"))
+                .and_then(|p| p.child("solidFill"))
+                .and_then(|f| f.child("srgbClr"))
+                .and_then(|c| c.attr_local("val"))
+                .and_then(Color::from_hex)
+                .unwrap_or(WHITE);
+            // Dark backgrounds get light default text.
+            let default_text = if (bg.r as u32 + bg.g as u32 + bg.b as u32) < 3 * 110 {
+                WHITE
+            } else {
+                BLACK
+            };
+            let mut canvas = Canvas::new(width, height, bg)?;
+            let tree = Self::sp_tree(slide)?;
+            for &si in &Self::shape_indices(tree) {
+                let e = tree.children[si].as_element().unwrap();
+                let xfrm = e.child("spPr").and_then(|sp| sp.child("xfrm"));
+                let emu = |el: Option<&XmlElement>, a: &str| -> f32 {
+                    el.and_then(|e| e.attr_local(a))
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|v| (v * scale) as f32)
+                        .unwrap_or(0.0)
+                };
+                let x = emu(xfrm.and_then(|x| x.child("off")), "x");
+                let y = emu(xfrm.and_then(|x| x.child("off")), "y");
+                let w = emu(xfrm.and_then(|x| x.child("ext")), "cx");
+                let h = emu(xfrm.and_then(|x| x.child("ext")), "cy");
+                if let Some(fill) = e
+                    .child("spPr")
+                    .and_then(|sp| sp.child("solidFill"))
+                    .and_then(|f| f.child("srgbClr"))
+                    .and_then(|c| c.attr_local("val"))
+                    .and_then(Color::from_hex)
+                {
+                    canvas.fill_rect(x, y, w, h, fill);
+                }
+                match e.local_name() {
+                    "pic" => {
+                        let bytes = self
+                            .dump_picture(slide, e)
+                            .and_then(|p| p.get("srcdata").and_then(|v| v.as_str()).map(String::from))
+                            .and_then(|b64| {
+                                use base64::Engine;
+                                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                            })
+                            .unwrap_or_default();
+                        canvas.draw_image(&bytes, x, y, w.max(2.0), h.max(2.0));
+                    }
+                    "graphicFrame" => {
+                        canvas.stroke_rect(x, y, w, h, MUTED);
+                        canvas.draw_text("[chart]", x + 8.0, y + 20.0, 14.0, MUTED, false);
+                    }
+                    _ => {
+                        let Some(tx) = e.child("txBody") else { continue };
+                        let mut top = y;
+                        let pad = 4.0;
+                        for p in tx.children_named("p") {
+                            let algn = p
+                                .child("pPr")
+                                .and_then(|pr| pr.attr_local("algn"))
+                                .unwrap_or("l");
+                            let mut spans: Vec<Span> = Vec::new();
+                            for r in p.children_named("r") {
+                                let rpr = r.child("rPr");
+                                let size_pt = rpr
+                                    .and_then(|rp| rp.attr_local("sz"))
+                                    .and_then(|v| v.parse::<f32>().ok())
+                                    .map(|v| v / 100.0)
+                                    .unwrap_or(18.0);
+                                let color = rpr
+                                    .and_then(|rp| rp.child("solidFill"))
+                                    .and_then(|f| f.child("srgbClr"))
+                                    .and_then(|c| c.attr_local("val"))
+                                    .and_then(Color::from_hex)
+                                    .unwrap_or(default_text);
+                                let bold =
+                                    rpr.map(|rp| rp.attr_local("b") == Some("1")).unwrap_or(false);
+                                let text =
+                                    r.child("t").map(|t| t.text_content()).unwrap_or_default();
+                                spans.push(Span {
+                                    text,
+                                    size: size_pt * px_per_pt,
+                                    color,
+                                    bold,
+                                });
+                            }
+                            if spans.is_empty() {
+                                top += 18.0 * px_per_pt * 1.25;
+                                continue;
+                            }
+                            let max_size = spans.iter().map(|s| s.size).fold(12.0f32, f32::max);
+                            let line_h = max_size * 1.25;
+                            let usable = (w - 2.0 * pad).max(20.0);
+                            for line in canvas.layout_spans(&spans, usable) {
+                                let lw = canvas.spans_width(&line);
+                                let lx = match algn {
+                                    "ctr" => x + pad + (usable - lw) / 2.0,
+                                    "r" => x + pad + usable - lw,
+                                    _ => x + pad,
+                                };
+                                let asc = canvas.ascent(max_size, false);
+                                canvas.draw_spans_line(&line, lx, top + pad + asc);
+                                top += line_h;
+                            }
+                        }
+                    }
+                }
+            }
+            images.push(canvas.png()?);
+        }
+        Ok(images)
+    }
+
     fn dump(&mut self) -> Result<serde_json::Value> {
         let mut ops = Vec::new();
         for (i, slide) in self.slides.iter().enumerate() {
@@ -1215,11 +1837,29 @@ impl Handler for Pptx {
                 "command": "add", "parent": "/", "type": "slide",
                 "props": slide_props,
             }));
+            if let Some(tprops) = dump_transition(&slide.xml) {
+                ops.push(json!({
+                    "command": "set",
+                    "path": format!("/slide[{}]", i + 1),
+                    "props": tprops,
+                }));
+            }
             let tree = Self::sp_tree(slide)?;
             for &si in &Self::shape_indices(tree) {
                 let e = tree.children[si].as_element().unwrap();
+                if e.local_name() == "pic" {
+                    // Pictures replay with their bytes embedded.
+                    if let Some(props) = self.dump_picture(slide, e) {
+                        ops.push(json!({
+                            "command": "add",
+                            "parent": format!("/slide[{}]", i + 1),
+                            "type": "image", "props": props,
+                        }));
+                    }
+                    continue;
+                }
                 if e.local_name() != "sp" {
-                    continue; // only textboxes are replayable today
+                    continue; // charts/groups are not replayable
                 }
                 let mut props = serde_json::Map::new();
                 props.insert("text".into(), json!(shape_text(e)));
@@ -1243,6 +1883,28 @@ impl Handler for Pptx {
                             props.insert("h".into(), json!(cy));
                         }
                     }
+                }
+                if let Some(fill) = e
+                    .child("spPr")
+                    .and_then(|sp| sp.child("solidFill"))
+                    .and_then(|f| f.child("srgbClr"))
+                    .and_then(|c| c.attr_local("val"))
+                {
+                    props.insert("fill".into(), json!(fill));
+                }
+                if let Some(algn) = e
+                    .child("txBody")
+                    .and_then(|tx| tx.child("p"))
+                    .and_then(|p| p.child("pPr"))
+                    .and_then(|pr| pr.attr_local("algn"))
+                {
+                    let align = match algn {
+                        "ctr" => "center",
+                        "r" => "right",
+                        "just" => "justify",
+                        _ => "left",
+                    };
+                    props.insert("align".into(), json!(align));
                 }
                 // First run's formatting as a shape-level approximation.
                 if let Some(rpr) = e
@@ -1286,6 +1948,91 @@ impl Handler for Pptx {
 /// New slides live only in memory until save; treat them as present.
 fn slide_is_new(_part: &str) -> bool {
     true
+}
+
+/// Reverse-map a p:transition into replayable set props.
+fn dump_transition(slide_xml: &XmlElement) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let transition = slide_xml.child("transition")?;
+    let effect = transition.elements().next()?;
+    let mut props = serde_json::Map::new();
+    props.insert("transition".into(), json!(effect.local_name()));
+    if let Some(dir) = effect.attr_local("dir") {
+        let word = match dir {
+            "l" => "left",
+            "r" => "right",
+            "u" => "up",
+            "d" => "down",
+            "horz" => "horizontal",
+            "vert" => "vertical",
+            "in" => "in",
+            "out" => "out",
+            "ld" => "left-down",
+            "lu" => "left-up",
+            "rd" => "right-down",
+            "ru" => "right-up",
+            other => other,
+        };
+        props.insert("direction".into(), json!(word));
+    }
+    if let Some(spd) = transition.attr_local("spd") {
+        let word = match spd {
+            "med" => "medium",
+            other => other,
+        };
+        props.insert("speed".into(), json!(word));
+    }
+    if let Some(adv) = transition.attr_local("advTm") {
+        props.insert("advance".into(), json!(format!("{adv}ms")));
+    }
+    Some(props)
+}
+
+impl Pptx {
+    /// Replayable `add image` props (bytes embedded as srcdata) for a p:pic.
+    fn dump_picture(
+        &self,
+        slide: &Slide,
+        pic: &XmlElement,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let rid = pic
+            .child("blipFill")
+            .and_then(|f| f.child("blip"))
+            .and_then(|b| b.attr("r:embed").or_else(|| b.attr_local("embed")))?;
+        let target = slide
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Id") == Some(rid))
+            .and_then(|r| r.attr_local("Target"))?;
+        let part = resolve_target("ppt/slides", target);
+        let bytes = self.pkg.raw(&part).ok()?;
+        use base64::Engine;
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "srcdata".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        );
+        if let Some(cnvpr) = shape_cnvpr(pic) {
+            if let Some(name) = cnvpr.attr_local("name") {
+                props.insert("name".into(), json!(name));
+            }
+        }
+        if let Some(xfrm) = pic.child("spPr").and_then(|sp| sp.child("xfrm")) {
+            if let Some(off) = xfrm.child("off") {
+                if let (Some(x), Some(y)) = (off.attr_local("x"), off.attr_local("y")) {
+                    props.insert("x".into(), json!(x));
+                    props.insert("y".into(), json!(y));
+                }
+            }
+            if let Some(ext) = xfrm.child("ext") {
+                if let (Some(cx), Some(cy)) = (ext.attr_local("cx"), ext.attr_local("cy")) {
+                    props.insert("w".into(), json!(cx));
+                    props.insert("h".into(), json!(cy));
+                }
+            }
+        }
+        Some(props)
+    }
 }
 
 fn render_shape_html(e: &XmlElement, scale: f64, out: &mut String) {

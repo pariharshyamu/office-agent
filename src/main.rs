@@ -4,6 +4,7 @@
 //! path system, mirroring the command surface of iOfficeAI/OfficeCLI.
 
 mod batch;
+mod chart;
 mod docx;
 mod handler;
 mod helptext;
@@ -16,7 +17,10 @@ mod pkg;
 mod pptx;
 mod props;
 mod query;
+mod render;
+mod resident;
 mod templates;
+mod watch;
 mod xlsx;
 mod xml;
 
@@ -185,14 +189,26 @@ enum Command {
     },
     /// Run as a Model Context Protocol server on stdio
     Mcp,
+    /// Run a long-lived command loop: one command line in, one JSON line out
+    Resident,
+    /// Serve a live-reloading HTML preview of a document
+    Watch {
+        file: PathBuf,
+        /// Port to listen on (0 picks a free port)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
     /// Show the agent-oriented command guide
     Help {
         /// Optional topic: docx | xlsx | pptx
         topic: Option<String>,
     },
+    /// Unknown subcommands dispatch to `officecli-<name>` plugins on PATH
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
-fn open_handler(file: &Path) -> Result<Box<dyn Handler>> {
+pub(crate) fn open_handler(file: &Path) -> Result<Box<dyn Handler>> {
     if !file.exists() {
         bail!(
             "{} does not exist (use `officecli create {}` first)",
@@ -260,6 +276,36 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             json,
         } => {
             let mut handler = open_handler(&file)?;
+            if mode == "screenshot" {
+                let out_path =
+                    output.context("view screenshot needs -o out.png (multi-page → out-1.png, ...)")?;
+                let images = handler.screenshot()?;
+                let mut written = Vec::new();
+                if images.len() == 1 {
+                    std::fs::write(&out_path, &images[0])
+                        .with_context(|| format!("cannot write {}", out_path.display()))?;
+                    written.push(out_path.display().to_string());
+                } else {
+                    let stem = out_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("screenshot");
+                    let ext = out_path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+                    for (i, png) in images.iter().enumerate() {
+                        let path = out_path.with_file_name(format!("{stem}-{}.{ext}", i + 1));
+                        std::fs::write(&path, png)
+                            .with_context(|| format!("cannot write {}", path.display()))?;
+                        written.push(path.display().to_string());
+                    }
+                }
+                return done(
+                    Report::Data {
+                        text: format!("wrote {}", written.join(", ")),
+                        data: serde_json::json!({ "files": written }),
+                    },
+                    json,
+                );
+            }
             let report = handler.view(&mode)?;
             if let Some(out_path) = output {
                 let rendered = report.render(false);
@@ -410,7 +456,35 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             // stdout is the protocol channel; end without printing anything.
             std::process::exit(0);
         }
+        Command::Resident => {
+            if !allow_stdin {
+                bail!("cannot start resident mode from within MCP/resident");
+            }
+            resident::serve()?;
+            std::process::exit(0);
+        }
+        Command::Watch { file, port } => {
+            if !allow_stdin {
+                bail!("watch runs as a foreground server; start it from a shell, not over MCP/resident");
+            }
+            watch::serve(&file, port)?;
+            std::process::exit(0);
+        }
         Command::Help { topic } => done(Report::Text(helptext::help_for(topic.as_deref())?), false),
+        Command::External(args) => {
+            let name = args.first().cloned().unwrap_or_default();
+            if !allow_stdin {
+                bail!("unknown command '{name}' (plugins are not available over MCP/resident)");
+            }
+            let exe = format!("officecli-{name}");
+            match std::process::Command::new(&exe).args(&args[1..]).status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "unknown command '{name}': not a built-in and no '{exe}' plugin found on PATH (run 'officecli help')"
+                ),
+                Err(e) => Err(e).with_context(|| format!("cannot run plugin '{exe}'"))?,
+            }
+        }
     }
 }
 

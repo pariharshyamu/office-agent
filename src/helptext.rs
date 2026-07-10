@@ -12,7 +12,9 @@ Add --json to any command for structured output ({"ok":true,"data":...}).
 
 COMMANDS
   create <file> [--force]                       Create a blank document
-  view <file> [outline|text|stats|html] [-o F]  Inspect (html = snapshot file)
+  view <file> [outline|text|stats|html|screenshot|comments] [-o F]
+                                                Inspect (screenshot = PNG per
+                                                page/sheet/slide, needs -o)
   get <file> <path> [--depth N]                 Read an element
   query <file> <selector>                       CSS-like element search
   add <file> <parent> --type T [--prop k=v ...] Add an element
@@ -25,8 +27,12 @@ COMMANDS
   dump <file>                                   Replayable batch JSON
   batch <file> [--commands JSON|--input F|stdin] Many ops, one save
   validate <file>                               Check package structure
+  watch <file> [--port N]                       Live-reloading HTML preview
+  resident                                      Command loop (line in, JSON out)
   mcp                                           MCP server on stdio
   help [docx|xlsx|pptx]                         Format-specific guide
+
+Unknown subcommands run `officecli-<name>` plugins found on PATH.
 
 QUERY SELECTORS
   paragraph[style=Normal] > run[font!=Arial]    direct-child chain
@@ -37,6 +43,7 @@ VALUE FORMATS
   Colors      FF0000, #FF0000, red, rgb(255,0,0)
   Lengths     2cm, 1in, 72pt, 96px, or raw EMU (914400 = 1 inch)
   Font sizes  24 or 24pt
+  Durations   500ms, 1.5s, or milliseconds
   Booleans    true/false
 
 QUICK START
@@ -44,15 +51,21 @@ QUICK START
   officecli add deck.pptx / --type slide --prop title="Q4 Report" --prop background=1A1A2E
   officecli add deck.pptx '/slide[1]' --type shape --prop text="Revenue grew 25%" \
       --prop x=2cm --prop y=5cm --prop size=24 --prop color=FFFFFF
-  officecli view deck.pptx outline
+  officecli add deck.pptx '/slide[1]' --type chart --prop kind=pie \
+      --prop categories="East,West" --prop values="60,40"
+  officecli set deck.pptx '/slide[1]' --prop transition=fade
+  officecli view deck.pptx screenshot -o deck.png
 
   officecli create report.docx
   officecli add report.docx /body --type paragraph --prop text="Summary" --prop style=Heading1
+  officecli add report.docx '/body/p[1]' --type comment --prop text="Check" --prop author=Bot
   officecli set report.docx / --find draft --replace final
 
   officecli create data.xlsx
   officecli set data.xlsx /Sheet1/A1 --prop value=Name --prop bold=true
-  officecli set data.xlsx /Sheet1/B2 --prop value="=SUM(B1:B1)"
+  officecli add data.xlsx /Sheet1 --type chart --prop data=A1:B9 --prop kind=column
+  officecli add data.xlsx / --type pivot --prop source=A1:C9 --prop rows=Region \
+      --prop values=Sales --prop agg=sum
 
 Always quote paths with brackets ('/slide[1]') — shells glob-expand [].
 Run 'officecli help <format>' for element types and properties."#;
@@ -64,6 +77,7 @@ PATHS
   /body/p[3]/r[1]      first run in it        (alias: run)
   /body/tbl[1]         first table            (alias: table)
   /body/tbl[1]/tr[2]/tc[3]   row 2, cell 3    (aliases: row, cell/td)
+  /comment[1]          comment by id (remove only)
 
 ADD
   --type paragraph   props: text, style (Normal/Title/Heading1..3), align
@@ -74,8 +88,14 @@ ADD
   --type table       props: rows, cols (default 2x2)
   --type row         parent must be a table; copies the column count
   --type break       page break
-  --type image       props: src=file.png (PNG/JPEG/GIF), w/h (optional,
-                     aspect kept), align; intrinsic size at 96 dpi
+  --type image       props: src=file.png (PNG/JPEG/GIF) or srcdata=BASE64,
+                     w/h (optional, aspect kept), align
+  --type toc         table of contents field (parent /body); props: levels
+                     ("1-3"); Word populates it on open/update
+  --type field       props: kind=page|numpages|date|time|filename|author
+                     or code="..." (parent = a paragraph)
+  --type comment     props: text, author; attaches to a paragraph
+  --type footnote    props: text; adds superscript reference + note
 
 SET
   paragraph          text (replaces runs), style, align, plus run format
@@ -90,7 +110,9 @@ FIND / REPLACE
   --prop regex=true makes --find a regular expression
   Matches work across run boundaries; case-sensitive (use '(?i)...' + regex).
 
-VIEW  outline (headings + tables), text, stats"#;
+VIEW  outline (headings + tables), text, stats, html, comments,
+      screenshot (-o page.png; multi-page → page-1.png, ...)
+REMOVE  /comment[N] deletes a comment and its body markers"#;
 
 const XLSX: &str = r#"officecli xlsx — Excel workbooks
 
@@ -99,6 +121,7 @@ PATHS
   /sheet[2]/B5        cell (sheet by position)
   /Sheet1/A1:C10      range (get only)
   /Sheet1/row[5]      row 5
+  /Sheet1/B           column B  (also /Sheet1/col[2]; remove only)
 
 SET (cells are created on demand)
   value=Hello         inline string
@@ -116,17 +139,29 @@ ADD
   --type row     props: values="a,b,c" and/or c1=..., c2=...
                  --index N is the 1-based row number; later rows shift down
                  and formula references are rewritten to follow
+  --type column  props: at=B (or --index N, 1-based), values="a,b,c" (fills
+                 down from row 1), r1=..., r2=... ; cells shift right and
+                 formula references follow
+  --type chart   props: data=A1:C9 (first col = categories, first row =
+                 headers), kind=column|bar|line|pie, title, at=E2 (anchor
+                 cell), w/h (in cells); references live cells
+  --type pivot   props: source=A1:C9, rows=Header, values=Header,
+                 agg=sum|count|avg|min|max, name; writes a computed group-by
+                 summary to a new sheet (static table, not an interactive
+                 PivotTable)
 
 REMOVE
   /Sheet1        removes the sheet (refused for the last one)
   /Sheet1/row[5] removes the row and shifts rows up
+  /Sheet1/B      removes column B and shifts columns left (formulas follow)
   /Sheet1/B2     clears the cell
 
 FIND / REPLACE
   officecli set data.xlsx / --find draft --replace final
   (string cells only; find+format is not supported for xlsx)
 
-VIEW  outline (sheets + ranges), text (grid), stats"#;
+VIEW  outline (sheets + ranges), text (grid), stats, html,
+      screenshot (-o grid.png; one PNG per sheet)"#;
 
 const PPTX: &str = r#"officecli pptx — PowerPoint presentations
 
@@ -142,18 +177,30 @@ ADD
   --type shape   textbox; props: text, x, y, w, h (lengths), size (pt),
                  color, bold, italic, font, align, fill, name
                  '\n' in text starts a new paragraph
-  --type image   props: src=file.png, x, y, w, h (aspect kept)
+  --type image   props: src=file.png or srcdata=BASE64, x, y, w, h
+  --type chart   props: kind=column|bar|line|pie, categories="Q1,Q2",
+                 values="10,20", series=Name, values2=/series2= for more
+                 series, title, x/y/w/h; data is embedded in the chart
+                 (PowerPoint renders it; Edit Data needs a linked workbook)
 
 SET
   slide          background=COLOR
+                 transition=fade|cut|push|wipe|dissolve|circle|diamond|
+                 plus|wedge|wheel|zoom|cover|pull|split|blinds|checker|
+                 comb|strips|newsflash|random|none
+                 [direction=left|right|up|down|horizontal|vertical|in|out]
+                 [speed=slow|medium|fast or a duration] [advance=5s]
   shape          text (replaces content), x/y/w/h, fill, name, and
                  size/color/bold/italic/font/align applied to all runs
+                 animation=appear|fade|wipe (click-triggered entrance;
+                 [duration=500ms] [delay=0ms])
 
 FIND / REPLACE
   officecli set deck.pptx / --find draft --replace final
   (find+format is not supported for pptx)
 
-VIEW  outline (slides + shapes), text, stats
+VIEW  outline (slides + shapes), text, stats, html,
+      screenshot (-o deck.png; one PNG per slide)
 
 TIP  shape[1] is usually the title textbox on slides created with
      --prop title=...; content shapes start at shape[2]."#;

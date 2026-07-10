@@ -469,3 +469,191 @@ fn mcp_server_protocol() {
     assert_eq!(lines[3]["result"]["isError"], true);
     assert!(dir.join("t.docx").exists());
 }
+
+#[test]
+fn xlsx_columns_and_pivot() {
+    let dir = temp_dir("cols");
+    ok(&dir, &["create", "d.xlsx"]);
+    ok(&dir, &[
+        "batch", "d.xlsx", "--commands",
+        r#"[
+          {"command":"set","path":"/Sheet1/A1","props":{"value":"Region"}},
+          {"command":"set","path":"/Sheet1/B1","props":{"value":"Sales"}},
+          {"command":"set","path":"/Sheet1/A2","props":{"value":"East"}},
+          {"command":"set","path":"/Sheet1/B2","props":{"value":"100"}},
+          {"command":"set","path":"/Sheet1/A3","props":{"value":"West"}},
+          {"command":"set","path":"/Sheet1/B3","props":{"value":"250"}},
+          {"command":"set","path":"/Sheet1/A4","props":{"value":"East"}},
+          {"command":"set","path":"/Sheet1/B4","props":{"value":"50"}},
+          {"command":"set","path":"/Sheet1/C2","props":{"value":"=SUM(B2:B4)"}}
+        ]"#,
+    ]);
+    // Insert a column before B: refs shift B→C.
+    ok(&dir, &["add", "d.xlsx", "/Sheet1", "--type", "column", "--prop", "at=B", "--prop", "r1=Manager"]);
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/D2", "--json"]);
+    assert!(json.contains("=SUM(C2:C4)"), "{json}");
+    // Remove it again: refs shift back.
+    ok(&dir, &["remove", "d.xlsx", "/Sheet1/B"]);
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/C2", "--json"]);
+    assert!(json.contains("=SUM(B2:B4)"), "{json}");
+    // Computed pivot.
+    ok(&dir, &[
+        "add", "d.xlsx", "/", "--type", "pivot",
+        "--prop", "source=A1:B4", "--prop", "rows=Region",
+        "--prop", "values=Sales", "--prop", "agg=sum",
+    ]);
+    let text = ok(&dir, &["view", "d.xlsx", "text"]);
+    assert!(text.contains("Pivot"), "{text}");
+    assert!(text.contains("East\t150"), "{text}");
+    assert!(text.contains("Grand Total\t400"), "{text}");
+}
+
+#[test]
+fn charts_in_both_formats() {
+    let dir = temp_dir("charts");
+    ok(&dir, &["create", "d.xlsx"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A1", "--prop", "value=Q"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/B1", "--prop", "value=Rev"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A2", "--prop", "value=Q1"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/B2", "--prop", "value=10"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A3", "--prop", "value=Q2"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/B3", "--prop", "value=20"]);
+    let out = ok(&dir, &[
+        "add", "d.xlsx", "/Sheet1", "--type", "chart",
+        "--prop", "kind=column", "--prop", "data=A1:B3", "--prop", "title=Revenue",
+    ]);
+    assert!(out.contains("chart"), "{out}");
+    let bytes = std::fs::read(dir.join("d.xlsx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("xl/charts/chart1.xml").is_ok());
+    assert!(zip.by_name("xl/drawings/drawing1.xml").is_ok());
+
+    ok(&dir, &["create", "p.pptx"]);
+    ok(&dir, &["add", "p.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "p.pptx", "/slide[1]", "--type", "chart",
+        "--prop", "kind=pie", "--prop", "categories=A,B", "--prop", "values=60,40",
+    ]);
+    let bytes = std::fs::read(dir.join("p.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("ppt/charts/chart1.xml").is_ok());
+    let outline = ok(&dir, &["view", "p.pptx", "outline"]);
+    assert!(outline.contains("graphicFrame"), "{outline}");
+}
+
+#[test]
+fn docx_annotations() {
+    let dir = temp_dir("annot");
+    ok(&dir, &["create", "r.docx"]);
+    ok(&dir, &["add", "r.docx", "/body", "--type", "toc"]);
+    ok(&dir, &["add", "r.docx", "/body", "--type", "paragraph", "--prop", "text=Body text."]);
+    ok(&dir, &[
+        "add", "r.docx", "/body/p[2]", "--type", "comment",
+        "--prop", "text=Please verify", "--prop", "author=Reviewer",
+    ]);
+    ok(&dir, &["add", "r.docx", "/body/p[2]", "--type", "footnote", "--prop", "text=A source."]);
+    ok(&dir, &["add", "r.docx", "/body/p[2]", "--type", "field", "--prop", "kind=page"]);
+    let comments = ok(&dir, &["view", "r.docx", "comments"]);
+    assert!(comments.contains("Please verify") && comments.contains("Reviewer"), "{comments}");
+    let bytes = std::fs::read(dir.join("r.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    for part in ["word/comments.xml", "word/footnotes.xml", "word/settings.xml"] {
+        assert!(zip.by_name(part).is_ok(), "missing {part}");
+    }
+    ok(&dir, &["remove", "r.docx", "/comment[1]"]);
+    let comments = ok(&dir, &["view", "r.docx", "comments"]);
+    assert!(!comments.contains("Please verify"), "{comments}");
+}
+
+#[test]
+fn pptx_transitions_and_animations() {
+    let dir = temp_dir("anim");
+    ok(&dir, &["create", "p.pptx"]);
+    ok(&dir, &["add", "p.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "set", "p.pptx", "/slide[1]",
+        "--prop", "transition=push", "--prop", "direction=left",
+        "--prop", "speed=fast", "--prop", "advance=3s",
+    ]);
+    ok(&dir, &["set", "p.pptx", "/slide[1]/shape[1]", "--prop", "animation=fade"]);
+    let bytes = std::fs::read(dir.join("p.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/slide1.xml").unwrap(), &mut xml).unwrap();
+    assert!(xml.contains("<p:push dir=\"l\"/>"), "{xml}");
+    assert!(xml.contains("advTm=\"3000\""), "{xml}");
+    assert!(xml.contains("<p:timing>") && xml.contains("filter=\"fade\""), "{xml}");
+    // Transition survives a dump→replay cycle.
+    let dump = ok(&dir, &["dump", "p.pptx"]);
+    assert!(dump.contains("\"transition\": \"push\""), "{dump}");
+}
+
+#[test]
+fn screenshots_render_all_formats() {
+    let dir = temp_dir("shots");
+    ok(&dir, &["create", "d.docx"]);
+    ok(&dir, &["add", "d.docx", "/body", "--type", "paragraph", "--prop", "text=Hello", "--prop", "style=Heading1"]);
+    ok(&dir, &["view", "d.docx", "screenshot", "-o", "d.png"]);
+    ok(&dir, &["create", "s.xlsx"]);
+    ok(&dir, &["set", "s.xlsx", "/Sheet1/A1", "--prop", "value=42"]);
+    ok(&dir, &["view", "s.xlsx", "screenshot", "-o", "s.png"]);
+    ok(&dir, &["create", "p.pptx"]);
+    ok(&dir, &["add", "p.pptx", "/", "--type", "slide", "--prop", "title=T", "--prop", "background=1A1A2E"]);
+    ok(&dir, &["view", "p.pptx", "screenshot", "-o", "p.png"]);
+    for f in ["d.png", "s.png", "p.png"] {
+        let bytes = std::fs::read(dir.join(f)).unwrap();
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "{f} is not a PNG");
+        assert!(bytes.len() > 500, "{f} suspiciously small");
+    }
+    // Screenshot without -o is an error.
+    fails(&dir, &["view", "p.pptx", "screenshot"]);
+}
+
+#[test]
+fn resident_mode_loop() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = temp_dir("resident");
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .arg("resident")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "create t.xlsx").unwrap();
+    writeln!(stdin, "set t.xlsx /Sheet1/A1 --prop value=7").unwrap();
+    writeln!(stdin, "get t.xlsx /Sheet1/A1").unwrap();
+    writeln!(stdin, "explode t.xlsx").unwrap();
+    writeln!(stdin, "exit").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "one JSON line per command");
+    assert_eq!(lines[0]["ok"], true);
+    assert_eq!(lines[2]["data"]["results"][0]["text"], "7");
+    assert_eq!(lines[3]["ok"], false);
+}
+
+#[test]
+fn image_srcdata_dump_roundtrip() {
+    let dir = temp_dir("srcdata");
+    // 1x1 red PNG.
+    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+    ok(&dir, &["create", "a.docx"]);
+    ok(&dir, &["add", "a.docx", "/body", "--type", "image", "--prop", &format!("srcdata={png_b64}")]);
+    let dump = ok(&dir, &["dump", "a.docx"]);
+    assert!(dump.contains("srcdata"), "{dump}");
+    std::fs::write(dir.join("ops.json"), &dump).unwrap();
+    ok(&dir, &["create", "b.docx"]);
+    ok(&dir, &["batch", "b.docx", "--input", "ops.json"]);
+    let bytes = std::fs::read(dir.join("b.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("word/media/image1.png").is_ok());
+}

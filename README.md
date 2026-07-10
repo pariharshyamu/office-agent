@@ -11,7 +11,28 @@ validate, the DOM-path addressing system, `--prop` conventions, and JSON
 output) directly on top of the OOXML package format, so an agent that knows
 OfficeCLI can drive this tool with the same muscle memory.
 
-## Build
+## Install
+
+Linux / macOS:
+
+```bash
+curl -fsSL https://github.com/pariharshyamu/office-agent/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/pariharshyamu/office-agent/releases/latest/download/install.ps1 | iex
+```
+
+The installers pick the right prebuilt binary (Linux x64/arm64, macOS
+Apple-silicon/Intel, Windows x64/ARM64 — both Windows builds use the MSVC
+toolchain), install it to `~/.local/bin` (Windows:
+`%LOCALAPPDATA%\Programs\officecli`), and print PATH instructions if
+needed. Pin a version with `OFFICECLI_VERSION=v0.2.0`; change the
+directory with `OFFICECLI_INSTALL=...`.
+
+Or build from source:
 
 ```bash
 cargo build --release
@@ -78,7 +99,8 @@ Always quote paths containing brackets (`'/slide[1]'`) — shells glob-expand `[
 
 ```
 create <file> [--force]                          blank .docx/.xlsx/.pptx
-view <file> [outline|text|stats|html] [-o FILE]  inspect (html = static snapshot)
+view <file> [outline|text|stats|html|screenshot|comments] [-o FILE]
+                                                 inspect (screenshot = PNGs)
 get <file> <path> [--depth N] [--json]           read an element
 query <file> <selector> [--json]                 CSS-like element search
 add <file> <parent> --type T [--prop k=v ...]    add an element
@@ -91,8 +113,11 @@ remove <file> <path> [--json]                    delete an element
 dump <file>                                      replayable batch JSON
 batch <file> [--commands JSON | --input F]       many ops, one save cycle
 validate <file> [--json]                         package sanity check
+watch <file> [--port N]                          live-reloading HTML preview
+resident                                         command loop (line in, JSON line out)
 mcp                                              MCP server on stdio
 help [docx|xlsx|pptx]                            agent-oriented guide
+<anything else>                                  officecli-<name> plugin from PATH
 ```
 
 Paths are 1-based; `--index` is 0-based (array convention), except
@@ -156,28 +181,126 @@ officecli add deck.pptx '/slide[1]' --type image \
 ```
 
 PNG, JPEG, and GIF; intrinsic size is read from the file (96 dpi) and the
-aspect ratio is preserved when only one of `w`/`h` is given.
+aspect ratio is preserved when only one of `w`/`h` is given. Bytes can be
+passed inline with `--prop srcdata=BASE64` (used by `dump` for round-trips).
 
-### view html and dump
+### Charts
+
+```bash
+# xlsx: chart over live cells (first column = categories, first row = headers)
+officecli add data.xlsx /Sheet1 --type chart \
+    --prop data=A1:C9 --prop kind=column --prop title="Sales" --prop at=E2
+
+# pptx: chart with embedded data
+officecli add deck.pptx '/slide[1]' --type chart --prop kind=pie \
+    --prop categories="East,West,North" --prop values="40,35,25" \
+    --prop series="Share" --prop title="Regional share"
+```
+
+Kinds: `column`, `bar`, `line`, `pie`. xlsx charts reference the cells (they
+update when the data changes); pptx charts carry their data as cached
+literals (add `values2=`/`series2=`, ... for more series). Charts parse
+cleanly in openpyxl/python-pptx and render in Office and LibreOffice.
+
+### Pivot summaries (xlsx)
+
+```bash
+officecli add data.xlsx / --type pivot --prop source=A1:C99 \
+    --prop rows=Region --prop values=Sales --prop agg=sum
+```
+
+Writes a computed group-by summary (`sum`/`count`/`avg`/`min`/`max` plus a
+Grand Total) to a new sheet. It is a static table, not a native interactive
+PivotTable — agents usually want the numbers, not the UI widget.
+
+### Columns (xlsx)
+
+```bash
+officecli add data.xlsx /Sheet1 --type column --prop at=B --prop r1=Header
+officecli remove data.xlsx /Sheet1/B
+```
+
+Cells shift and **formula references are rewritten** on both row and column
+inserts/removals, across all sheets (`Sheet2!B5`-style references included).
+
+### Comments, footnotes, TOC, fields (docx)
+
+```bash
+officecli add report.docx '/body/p[2]' --type comment --prop text="Check this" --prop author=Reviewer
+officecli view report.docx comments
+officecli remove report.docx '/comment[1]'
+officecli add report.docx '/body/p[2]' --type footnote --prop text="Source: ..."
+officecli add report.docx /body --type toc --index 0
+officecli add report.docx '/body/p[5]' --type field --prop kind=page
+```
+
+The TOC is inserted as a dirty field with `updateFields` set, so Word
+populates it on open. Fields support `page`, `numpages`, `date`, `time`,
+`filename`, `author`, or raw `code="..."`.
+
+### Transitions and animations (pptx)
+
+```bash
+officecli set deck.pptx '/slide[1]' --prop transition=push --prop direction=left \
+    --prop speed=fast --prop advance=5s
+officecli set deck.pptx '/slide[1]/shape[2]' --prop animation=fade --prop duration=750ms
+```
+
+Transitions: `fade`, `cut`, `push`, `wipe`, `dissolve`, `circle`, `diamond`,
+`plus`, `wedge`, `wheel`, `zoom`, `cover`, `pull`, `split`, `blinds`,
+`checker`, `comb`, `strips`, `newsflash`, `random`, `none`. Animations are
+click-triggered entrance effects (`appear`, `fade`, `wipe`) built as a
+standard `p:timing` tree.
+
+### view html, view screenshot, watch, and dump
 
 `view html` renders a static, self-contained HTML snapshot — styled
 paragraphs and tables for docx, grids for xlsx, and absolutely-positioned
-slide canvases (with backgrounds, fonts, colors) for pptx — giving agents a
-render-look-fix loop without a browser engine:
+slide canvases (with backgrounds, fonts, colors) for pptx:
 
 ```bash
 officecli view deck.pptx html -o deck.html
 ```
 
-`dump` emits a replayable batch-JSON approximation of the content
-(paragraph/table text and styles, cell values and formulas, slides and
-textboxes) that `batch` can apply to a fresh file:
+`view screenshot` renders real PNGs — no browser engine involved; text is
+rasterized with an embedded DejaVu Sans (regular + bold). One PNG per
+slide/sheet/page (`out.png`, or `out-1.png`, `out-2.png`, ... for multiple),
+giving agents a genuine render-look-fix loop:
+
+```bash
+officecli view deck.pptx screenshot -o deck.png
+```
+
+The rendering is an approximation (positions, fills, text size/color/bold,
+PNG images; JPEG/GIF and charts appear as placeholders), designed to make
+layout problems visible rather than to be print-accurate.
+
+`watch` serves the HTML view on localhost and auto-reloads the browser
+whenever the file changes on disk — edit with officecli in one terminal,
+see the result live:
+
+```bash
+officecli watch deck.pptx --port 8787
+```
+
+`dump` emits replayable batch-JSON (paragraph/run text and formatting,
+images with base64 bytes, cell values/formulas/styles, slides, textboxes,
+pictures, transitions) that `batch` can apply to a fresh file:
 
 ```bash
 officecli dump deck.pptx > ops.json
 officecli create copy.pptx
 officecli batch copy.pptx --input ops.json
 ```
+
+### Resident mode and plugins
+
+`officecli resident` keeps one process alive for agents issuing many
+commands: each stdin line is a command string, each response is one compact
+JSON line (`{"ok":true,"data":...}`); `exit` or EOF ends the loop.
+
+Unknown subcommands dispatch to plugins: `officecli foo args...` runs
+`officecli-foo args...` if such an executable exists on PATH.
 
 ### MCP server
 
@@ -212,24 +335,28 @@ failure.
 
 **Word (.docx)** — paragraphs (text, style Normal/Title/Heading1–3, align),
 runs (bold/italic/underline/size/color/font/highlight), tables (create,
-add row, set cell text + formatting), page breaks, insert before/after/at
-index, whole-scope find/replace and find+format with run splitting,
-outline/text/stats views.
+add row, set cell text + formatting), page breaks, images, comments (add/
+list/remove), footnotes, TOC and fields, insert before/after/at index,
+whole-scope find/replace and find+format with run splitting,
+outline/text/stats/html/comments/screenshot views.
 
 **Excel (.xlsx)** — cells created on demand via `set` (strings, numbers,
 booleans, formulas auto-detected by `=`), shared-string-aware reads,
 cell styling (bold/italic/color/size/font/fill) through a styles-table
-manager, sheets (add/rename/remove), rows (insert with shift, remove with
-shift, `values=` / `cN=` fills), ranges on `get`, `$Sheet:A1` addressing,
-find/replace over string cells, grid/outline/stats views. Formulas are
-stored uncalculated with `fullCalcOnLoad` so Excel/LibreOffice recalculate
-on open.
+manager, sheets (add/rename/remove), rows and columns (insert/remove with
+shifts and workbook-wide formula-reference rewriting), charts over live
+ranges, computed pivot summaries, ranges on `get`, `$Sheet:A1` addressing,
+find/replace over string cells, grid/outline/stats/html/screenshot views.
+Formulas are stored uncalculated with `fullCalcOnLoad` so Excel/LibreOffice
+recalculate on open.
 
 **PowerPoint (.pptx)** — slides (add with `title`/`background`, position
 with `--index/--before/--after`, remove with full relationship cleanup),
 textbox shapes (text, x/y/w/h in any length unit, size/color/bold/italic/
-font/align/fill/name), shape addressing by position, `@name=`, or `@id=`,
-slide background, find/replace across slides, outline/text/stats views.
+font/align/fill/name), images, charts, slide transitions, entrance
+animations, shape addressing by position, `@name=`, or `@id=`, slide
+background, find/replace across slides, outline/text/stats/html/screenshot
+views.
 
 Blank documents created by `create` open without repair prompts in Word,
 Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
@@ -237,13 +364,16 @@ Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
 
 ## Known limitations vs upstream OfficeCLI
 
-This is a focused port, not a feature-complete clone. Not (yet) implemented:
-PNG rendering (`view screenshot`) and the live `watch` preview server
-(`view html` provides static snapshots), resident mode, charts, pivot
-tables, comments/footnotes/TOC/fields, animations/transitions, plugins,
-column-shift formula rewriting (row shifts are rewritten), and `dump` is a
-content-level approximation rather than a full-fidelity round-trip. The
-architecture (lossless XML DOM over the zip package, one handler per
+This is a focused port, not a feature-complete clone. Honest edges of the
+implemented features: `view screenshot` is an approximation (PNG images
+composite; JPEG/GIF and charts render as placeholders; no italics or
+justified text); pivots are computed summary tables, not native interactive
+PivotTables; pptx charts embed cached data without a linked workbook, so
+PowerPoint's "Edit Data" won't open a sheet; animations cover click-triggered
+entrance effects only; `dump` is a high-fidelity content replay, not a
+byte-identical round-trip. Not implemented: scatter charts, docx charts,
+xlsx cell comments, headers/footers, and PowerPoint motion-path animations.
+The architecture (lossless XML DOM over the zip package, one handler per
 format behind a common trait) is designed so these can be added
 incrementally.
 
@@ -261,15 +391,25 @@ src/
   query.rs      CSS-like selector parser + NodeInfo-tree matcher
   media.rs      image sniffing (PNG/JPEG/GIF) + package bookkeeping
   html.rs       escaping + page shell for `view html`
+  render.rs     PNG canvas (tiny-skia + ab_glyph + embedded DejaVu Sans)
+  chart.rs      DrawingML chartSpace builder (xlsx + pptx charts)
   mcp.rs        Model Context Protocol server (stdio JSON-RPC)
+  resident.rs   long-lived command loop (line in, JSON line out)
+  watch.rs      live-preview HTTP server (std-only, mtime polling)
   templates.rs  minimal valid blank .docx/.xlsx/.pptx packages
-  docx.rs       Word handler (incl. cross-run find/replace + run splitting)
+  docx.rs       Word handler (incl. cross-run find/replace + run splitting,
+                comments/footnotes/TOC/fields, page renderer)
   xlsx.rs       Excel handler (incl. shared strings, styles manager,
-                formula-reference rewriting on row shifts)
-  pptx.rs       PowerPoint handler (slides/shapes/images/relationships)
+                row/column shifts with formula-reference rewriting,
+                charts, pivot summaries, grid renderer)
+  pptx.rs       PowerPoint handler (slides/shapes/images/charts/
+                transitions/animations, slide renderer)
   batch.rs      JSON batch runner
   helptext.rs   `officecli help` agent guide
 ```
+
+The embedded DejaVu fonts are under the Bitstream Vera license
+(`assets/DEJAVU-LICENSE`).
 
 Only untouched parts are rewritten byte-identically: the DOM preserves
 qualified names, attribute order, and text verbatim, so editing one

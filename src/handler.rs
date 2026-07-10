@@ -53,4 +53,9 @@ pub trait Handler {
 
     /// Emit a replayable batch-JSON representation of the document content.
     fn dump(&mut self) -> Result<serde_json::Value>;
+
+    /// Render the document as PNGs, one per slide/sheet/page.
+    fn screenshot(&mut self) -> Result<Vec<Vec<u8>>> {
+        anyhow::bail!("screenshot is not supported for this format")
+    }
 }

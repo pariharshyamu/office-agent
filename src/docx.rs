@@ -14,6 +14,11 @@ use crate::xml::{el, XmlElement, XmlNode};
 
 const DOCUMENT_PART: &str = "word/document.xml";
 const DOC_RELS_PART: &str = "word/_rels/document.xml.rels";
+const COMMENTS_PART: &str = "word/comments.xml";
+const FOOTNOTES_PART: &str = "word/footnotes.xml";
+const SETTINGS_PART: &str = "word/settings.xml";
+const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 pub struct Docx {
     pkg: Package,
@@ -56,10 +61,7 @@ impl Docx {
     }
 
     fn build_image_paragraph(&mut self, props: &Props) -> Result<XmlElement> {
-        let src = props
-            .get("src")
-            .context("image needs --prop src=path/to/file.png")?;
-        let image = crate::media::load_image(src)?;
+        let image = crate::media::image_from_props(props)?;
         let part = crate::media::store_image(&mut self.pkg, "word/media", &image)?;
         let target = part.strip_prefix("word/").unwrap_or(&part).to_string();
         let rid =
@@ -445,6 +447,355 @@ impl Docx {
         Ok(result)
     }
 
+    // ------------------------------------- comments / footnotes / fields ----
+
+    /// Load a satellite part (comments/footnotes), creating it with `blank`
+    /// plus its content-type override and document relationship when absent.
+    fn ensure_satellite(
+        &mut self,
+        part: &'static str,
+        blank: XmlElement,
+        content_type: &str,
+        rel_type: &str,
+    ) -> Result<XmlElement> {
+        if self.pkg.has_part(part) {
+            return self.pkg.xml(part);
+        }
+        self.pkg.add_override(part, content_type)?;
+        let target = part.strip_prefix("word/").unwrap_or(part).to_string();
+        let has_rel = self
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .any(|r| r.attr_local("Type") == Some(rel_type));
+        if !has_rel {
+            crate::media::add_relationship(&mut self.rels, rel_type, &target);
+        }
+        Ok(blank)
+    }
+
+    fn add_comment(&mut self, target: &[usize], props: &Props) -> Result<Report> {
+        let text = props.get("text").context("comment needs --prop text=...")?.to_string();
+        let author = props.get("author").unwrap_or("officecli").to_string();
+        let initials: String = author
+            .split_whitespace()
+            .filter_map(|w| w.chars().next())
+            .take(3)
+            .collect::<String>()
+            .to_uppercase();
+
+        if self.node_at(target)?.local_name() != "p" {
+            bail!("comments attach to a paragraph path like /body/p[2]");
+        }
+
+        let mut comments = self.ensure_satellite(
+            COMMENTS_PART,
+            el("w:comments", &[("xmlns:w", W_NS)]),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+            &format!("{REL_NS}/comments"),
+        )?;
+        let id = comments
+            .children_named("comment")
+            .into_iter()
+            .filter_map(|c| c.attr_local("id").and_then(|v| v.parse::<u32>().ok()))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
+        let id_str = id.to_string();
+
+        let mut comment = el(
+            "w:comment",
+            &[
+                ("w:id", id_str.as_str()),
+                ("w:author", author.as_str()),
+                ("w:initials", if initials.is_empty() { "OC" } else { &initials }),
+            ],
+        );
+        let mut p = XmlElement::new("w:p");
+        let mut r = XmlElement::new("w:r");
+        push_text_nodes(&mut r, &text);
+        p.push(r);
+        comment.push(p);
+        comments.push(comment);
+        self.pkg.put_xml(COMMENTS_PART, &comments)?;
+
+        // Range markers + reference run on the target paragraph.
+        let para = self.node_at_mut(target)?;
+        let after_ppr = para
+            .children
+            .iter()
+            .position(|n| !matches!(n, XmlNode::Element(e) if e.local_name() == "pPr"))
+            .unwrap_or(para.children.len());
+        para.children.insert(
+            after_ppr,
+            XmlNode::Element(el("w:commentRangeStart", &[("w:id", id_str.as_str())])),
+        );
+        para.push(el("w:commentRangeEnd", &[("w:id", id_str.as_str())]));
+        let mut ref_run = XmlElement::new("w:r");
+        ref_run.push(el("w:commentReference", &[("w:id", id_str.as_str())]));
+        para.push(ref_run);
+
+        let mut info = NodeInfo::new(format!("/comment[{id}]"), "comment");
+        info.text = Some(text);
+        info.attr("id", id_str);
+        info.attr("author", author);
+        Ok(Report::Nodes(vec![info]))
+    }
+
+    fn remove_comment(&mut self, id: u32) -> Result<Report> {
+        if !self.pkg.has_part(COMMENTS_PART) {
+            bail!("document has no comments");
+        }
+        let mut comments = self.pkg.xml(COMMENTS_PART)?;
+        let id_str = id.to_string();
+        let before = comments.children.len();
+        comments.children.retain(|n| {
+            !matches!(n, XmlNode::Element(e)
+                if e.local_name() == "comment" && e.attr_local("id") == Some(id_str.as_str()))
+        });
+        if comments.children.len() == before {
+            bail!("no comment with id {id}");
+        }
+        self.pkg.put_xml(COMMENTS_PART, &comments)?;
+        // Strip markers and reference runs from the body.
+        fn strip(e: &mut XmlElement, id: &str) {
+            e.children.retain(|n| {
+                let XmlNode::Element(c) = n else { return true };
+                let is_marker = matches!(c.local_name(), "commentRangeStart" | "commentRangeEnd")
+                    && c.attr_local("id") == Some(id);
+                let is_ref_run = c.local_name() == "r"
+                    && c.elements().any(|g| {
+                        g.local_name() == "commentReference" && g.attr_local("id") == Some(id)
+                    });
+                !(is_marker || is_ref_run)
+            });
+            for child in e.children.iter_mut() {
+                if let XmlNode::Element(c) = child {
+                    strip(c, id);
+                }
+            }
+        }
+        strip(self.body_mut()?, &id_str);
+        Ok(Report::Data {
+            text: format!("removed comment {id}"),
+            data: json!({ "removed": format!("/comment[{id}]") }),
+        })
+    }
+
+    /// List of (id, author, text) comments.
+    fn comments(&self) -> Result<Vec<(String, String, String)>> {
+        if !self.pkg.has_part(COMMENTS_PART) {
+            return Ok(Vec::new());
+        }
+        let comments = self.pkg.xml(COMMENTS_PART)?;
+        Ok(comments
+            .children_named("comment")
+            .into_iter()
+            .map(|c| {
+                (
+                    c.attr_local("id").unwrap_or("?").to_string(),
+                    c.attr_local("author").unwrap_or("").to_string(),
+                    c.text_content(),
+                )
+            })
+            .collect())
+    }
+
+    fn add_footnote(&mut self, target: &[usize], props: &Props) -> Result<Report> {
+        let text = props.get("text").context("footnote needs --prop text=...")?.to_string();
+        if self.node_at(target)?.local_name() != "p" {
+            bail!("footnotes attach to a paragraph path like /body/p[2]");
+        }
+        let mut blank = el("w:footnotes", &[("xmlns:w", W_NS)]);
+        for (typ, id, marker) in [
+            ("separator", "-1", "w:separator"),
+            ("continuationSeparator", "0", "w:continuationSeparator"),
+        ] {
+            let mut fnote = el("w:footnote", &[("w:type", typ), ("w:id", id)]);
+            let mut p = XmlElement::new("w:p");
+            let mut r = XmlElement::new("w:r");
+            r.push(XmlElement::new(marker));
+            p.push(r);
+            fnote.push(p);
+            blank.push(fnote);
+        }
+        let mut footnotes = self.ensure_satellite(
+            FOOTNOTES_PART,
+            blank,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+            &format!("{REL_NS}/footnotes"),
+        )?;
+        let id = footnotes
+            .children_named("footnote")
+            .into_iter()
+            .filter_map(|c| c.attr_local("id").and_then(|v| v.parse::<i32>().ok()))
+            .max()
+            .map(|m| m.max(0) + 1)
+            .unwrap_or(1);
+        let id_str = id.to_string();
+
+        let mut fnote = el("w:footnote", &[("w:id", id_str.as_str())]);
+        let mut p = XmlElement::new("w:p");
+        let mut ref_run = XmlElement::new("w:r");
+        let mut rpr = XmlElement::new("w:rPr");
+        rpr.push(el("w:vertAlign", &[("w:val", "superscript")]));
+        ref_run.push(rpr);
+        ref_run.push(XmlElement::new("w:footnoteRef"));
+        p.push(ref_run);
+        let mut text_run = XmlElement::new("w:r");
+        push_text_nodes(&mut text_run, &format!(" {text}"));
+        p.push(text_run);
+        fnote.push(p);
+        footnotes.push(fnote);
+        self.pkg.put_xml(FOOTNOTES_PART, &footnotes)?;
+
+        // Superscript reference in the body paragraph.
+        let para = self.node_at_mut(target)?;
+        let mut r = XmlElement::new("w:r");
+        let mut rpr = XmlElement::new("w:rPr");
+        rpr.push(el("w:vertAlign", &[("w:val", "superscript")]));
+        r.push(rpr);
+        r.push(el("w:footnoteReference", &[("w:id", id_str.as_str())]));
+        para.push(r);
+
+        let mut info = NodeInfo::new(format!("/footnote[{id}]"), "footnote");
+        info.text = Some(text);
+        info.attr("id", id_str);
+        Ok(Report::Nodes(vec![info]))
+    }
+
+    /// Complex field runs: begin(dirty) + instrText + separate + placeholder + end.
+    fn build_field_runs(instr: &str, placeholder: &str) -> Vec<XmlElement> {
+        let mut runs = Vec::new();
+        let mut begin = XmlElement::new("w:r");
+        begin.push(el("w:fldChar", &[("w:fldCharType", "begin"), ("w:dirty", "true")]));
+        runs.push(begin);
+        let mut instr_r = XmlElement::new("w:r");
+        let mut it = el("w:instrText", &[("xml:space", "preserve")]);
+        it.push_text(&format!(" {instr} "));
+        instr_r.push(it);
+        runs.push(instr_r);
+        let mut sep = XmlElement::new("w:r");
+        sep.push(el("w:fldChar", &[("w:fldCharType", "separate")]));
+        runs.push(sep);
+        if !placeholder.is_empty() {
+            let mut text_r = XmlElement::new("w:r");
+            let mut t = XmlElement::new("w:t");
+            t.set_attr("xml:space", "preserve");
+            t.push_text(placeholder);
+            text_r.push(t);
+            runs.push(text_r);
+        }
+        let mut end = XmlElement::new("w:r");
+        end.push(el("w:fldChar", &[("w:fldCharType", "end")]));
+        runs.push(end);
+        runs
+    }
+
+    /// Field instruction from a friendly name or raw code.
+    fn field_instr(props: &Props) -> Result<String> {
+        if let Some(code) = props.get("code").or_else(|| props.get("instr")) {
+            return Ok(code.to_string());
+        }
+        let kind = props
+            .get("kind")
+            .context("field needs --prop kind=page|numpages|date|time|filename|author or --prop code=\"...\"")?;
+        Ok(match kind.to_ascii_lowercase().as_str() {
+            "page" => "PAGE".to_string(),
+            "numpages" | "pages" => "NUMPAGES".to_string(),
+            "date" => "DATE".to_string(),
+            "time" => "TIME".to_string(),
+            "filename" => "FILENAME".to_string(),
+            "author" => "AUTHOR".to_string(),
+            other => bail!("unknown field kind '{other}' (page/numpages/date/time/filename/author, or use code=)"),
+        })
+    }
+
+    fn add_field(&mut self, target: &[usize], props: &Props) -> Result<Report> {
+        if self.node_at(target)?.local_name() != "p" {
+            bail!("fields are added to a paragraph path like /body/p[2]");
+        }
+        let instr = Self::field_instr(props)?;
+        let para = self.node_at_mut(target)?;
+        for run in Self::build_field_runs(&instr, "") {
+            para.push(run);
+        }
+        let display = self.display_path(target)?;
+        let mut info = NodeInfo::new(&display, "field");
+        info.attr("code", instr);
+        Ok(Report::Nodes(vec![info]))
+    }
+
+    /// Make sure word/settings.xml exists and asks Word to update fields on
+    /// open (used by TOC so it populates itself).
+    fn ensure_update_fields(&mut self) -> Result<()> {
+        let mut settings = self.ensure_satellite(
+            SETTINGS_PART,
+            el("w:settings", &[("xmlns:w", W_NS)]),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+            &format!("{REL_NS}/settings"),
+        )?;
+        settings
+            .ensure_child("updateFields", "w:updateFields", true)
+            .set_attr("w:val", "true");
+        self.pkg.put_xml(SETTINGS_PART, &settings)
+    }
+
+    fn build_toc_paragraph(&self, props: &Props) -> XmlElement {
+        let levels = props.get("levels").unwrap_or("1-3");
+        let instr = format!("TOC \\o \"{levels}\" \\h \\z \\u");
+        let mut p = XmlElement::new("w:p");
+        for run in Self::build_field_runs(
+            &instr,
+            "Table of contents (open in Word and update the field, or print/export, to populate).",
+        ) {
+            p.push(run);
+        }
+        p
+    }
+
+    // ------------------------------------------------------------ dump ----
+
+    /// If the paragraph is an embedded picture, return `add image` props
+    /// with the bytes base64-encoded as `srcdata`.
+    fn dump_image_paragraph(
+        &self,
+        p: &XmlElement,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+        let Some(blip) = find_descendant(p, "blip") else {
+            return Ok(None);
+        };
+        let Some(rid) = blip.attr("r:embed").or_else(|| blip.attr_local("embed")) else {
+            return Ok(None);
+        };
+        let Some(target) = self
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Id") == Some(rid))
+            .and_then(|r| r.attr_local("Target"))
+        else {
+            return Ok(None);
+        };
+        let part = format!("word/{}", target.trim_start_matches("./"));
+        let Ok(bytes) = self.pkg.raw(&part) else {
+            return Ok(None);
+        };
+        use base64::Engine;
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "srcdata".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        );
+        if let Some(extent) = find_descendant(p, "extent") {
+            if let (Some(cx), Some(cy)) = (extent.attr_local("cx"), extent.attr_local("cy")) {
+                props.insert("w".into(), json!(cx));
+                props.insert("h".into(), json!(cy));
+            }
+        }
+        Ok(Some(props))
+    }
+
     // ------------------------------------------------------------- set ----
 
     fn apply_paragraph_props(&mut self, indices: &[usize], props: &Props) -> Result<()> {
@@ -558,6 +909,26 @@ fn describe_rpr(rpr: &XmlElement, info: &mut NodeInfo) {
     if let Some(fonts) = rpr.child("rFonts").and_then(|s| s.attr_local("ascii")) {
         info.attr("font", fonts);
     }
+}
+
+/// First descendant element with the given local name (depth-first).
+fn find_descendant<'a>(e: &'a XmlElement, local: &str) -> Option<&'a XmlElement> {
+    for child in e.elements() {
+        if child.local_name() == local {
+            return Some(child);
+        }
+        if let Some(found) = find_descendant(child, local) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Run formatting as replayable prop pairs.
+fn rpr_props(rpr: &XmlElement) -> Vec<(String, String)> {
+    let mut info = NodeInfo::new("", "run");
+    describe_rpr(rpr, &mut info);
+    info.attributes
 }
 
 fn has_run_format_props(props: &Props) -> bool {
@@ -1116,7 +1487,19 @@ impl Handler for Docx {
                 }
                 Ok(Report::Text(crate::html::page("Document", &out)))
             }
-            other => bail!("unknown view mode '{other}' for docx (text/outline/stats/html)"),
+            "comments" => {
+                let comments = self.comments()?;
+                let mut nodes = Vec::new();
+                for (id, author, text) in comments {
+                    let mut info = NodeInfo::new(format!("/comment[{id}]"), "comment");
+                    info.text = Some(text);
+                    info.attr("id", id);
+                    info.attr("author", author);
+                    nodes.push(info);
+                }
+                Ok(Report::Nodes(nodes))
+            }
+            other => bail!("unknown view mode '{other}' for docx (text/outline/stats/html/comments)"),
         }
     }
 
@@ -1140,6 +1523,15 @@ impl Handler for Docx {
         let dpath = path::parse(parent)?;
         let parent_indices = self.resolve(&dpath)?;
         let parent_local = self.node_at(&parent_indices)?.local_name().to_string();
+
+        // Types that attach to an existing element rather than inserting a
+        // new sibling.
+        match typ.to_ascii_lowercase().as_str() {
+            "comment" => return self.add_comment(&parent_indices, props),
+            "footnote" => return self.add_footnote(&parent_indices, props),
+            "field" => return self.add_field(&parent_indices, props),
+            _ => {}
+        }
 
         let element = match typ.to_ascii_lowercase().as_str() {
             "paragraph" | "p" | "para" => {
@@ -1195,8 +1587,15 @@ impl Handler for Docx {
                 }
                 self.build_image_paragraph(props)?
             }
+            "toc" => {
+                if parent_local != "body" {
+                    bail!("a TOC is added to /body");
+                }
+                self.ensure_update_fields()?;
+                self.build_toc_paragraph(props)
+            }
             other => bail!(
-                "unsupported docx element type '{other}' (paragraph/run/table/row/break/image)"
+                "unsupported docx element type '{other}' (paragraph/run/table/row/break/image/toc/field/comment/footnote)"
             ),
         };
 
@@ -1301,6 +1700,13 @@ impl Handler for Docx {
         if dpath.is_root() {
             bail!("cannot remove the document root");
         }
+        // /comment[N] removes comment N plus its body markers.
+        if dpath.segments.len() == 1 && dpath.segments[0].name.eq_ignore_ascii_case("comment") {
+            let id = dpath.segments[0]
+                .index()
+                .context("comment removal needs an id, e.g. /comment[1]")? as u32;
+            return self.remove_comment(id);
+        }
         let indices = self.resolve(&dpath)?;
         let display = self.display_path(&indices)?;
         let (parent_indices, last) = indices.split_at(indices.len() - 1);
@@ -1383,15 +1789,197 @@ impl Handler for Docx {
         })
     }
 
-    fn dump(&mut self) -> Result<serde_json::Value> {
-        let body = self.body()?;
-        let mut ops = Vec::new();
-        let mut tbl_count = 0usize;
+    fn screenshot(&mut self) -> Result<Vec<Vec<u8>>> {
+        use crate::render::{Canvas, Color, Span, BLACK, GRID, WHITE};
+        // US Letter at 96 dpi with 1in margins.
+        let (page_w, page_h, margin) = (816.0f32, 1056.0f32, 96.0f32);
+        let content_w = page_w - 2.0 * margin;
+        let px_per_pt = 96.0 / 72.0;
+
+        let body = self.body()?.clone();
+        let mut pages: Vec<Canvas> = vec![Canvas::new(page_w as u32, page_h as u32, WHITE)?];
+        let mut y = margin;
+        macro_rules! new_page {
+            () => {{
+                pages.push(Canvas::new(page_w as u32, page_h as u32, WHITE)?);
+                y = margin;
+            }};
+        }
+        macro_rules! need {
+            ($h:expr) => {
+                if y + $h > page_h - margin && y > margin {
+                    new_page!();
+                }
+            };
+        }
+
         for element in body.elements() {
             match element.local_name() {
                 "p" => {
+                    // Embedded image?
+                    if let Some(props) = self.dump_image_paragraph(element)? {
+                        use base64::Engine;
+                        let bytes = props
+                            .get("srcdata")
+                            .and_then(|v| v.as_str())
+                            .and_then(|b64| {
+                                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                            })
+                            .unwrap_or_default();
+                        let emu_px = |v: Option<&serde_json::Value>| {
+                            v.and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .map(|emu| (emu / 9525.0) as f32)
+                        };
+                        let iw = emu_px(props.get("w")).unwrap_or(200.0).min(content_w);
+                        let ih = emu_px(props.get("h")).unwrap_or(150.0).min(page_h - 2.0 * margin);
+                        need!(ih);
+                        let align = element
+                            .child("pPr")
+                            .and_then(|ppr| ppr.child("jc"))
+                            .and_then(|s| s.attr_local("val"));
+                        let x = match align {
+                            Some("center") => margin + (content_w - iw) / 2.0,
+                            Some("right") => margin + content_w - iw,
+                            _ => margin,
+                        };
+                        pages.last_mut().unwrap().draw_image(&bytes, x, y, iw, ih);
+                        y += ih + 8.0;
+                        continue;
+                    }
+                    let style = element
+                        .child("pPr")
+                        .and_then(|ppr| ppr.child("pStyle"))
+                        .and_then(|s| s.attr_local("val"))
+                        .unwrap_or("Normal");
+                    let (base_pt, base_bold) = match style {
+                        "Title" => (28.0, true),
+                        "Heading1" => (20.0, true),
+                        "Heading2" => (16.0, true),
+                        "Heading3" => (14.0, true),
+                        _ => (11.0, false),
+                    };
+                    let mut spans: Vec<Span> = Vec::new();
+                    let mut forced_break = false;
+                    for run in element.elements().filter(|e| e.local_name() == "r") {
+                        if run
+                            .elements()
+                            .any(|c| c.local_name() == "br" && c.attr_local("type") == Some("page"))
+                        {
+                            forced_break = true;
+                        }
+                        let rpr = run.child("rPr");
+                        let size_pt = rpr
+                            .and_then(|rp| rp.child("sz"))
+                            .and_then(|s| s.attr_local("val"))
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .map(|half| half / 2.0)
+                            .unwrap_or(base_pt);
+                        let bold = base_bold
+                            || rpr.map(|rp| rp.child("b").is_some()).unwrap_or(false);
+                        let color = rpr
+                            .and_then(|rp| rp.child("color"))
+                            .and_then(|c| c.attr_local("val"))
+                            .and_then(Color::from_hex)
+                            .unwrap_or(BLACK);
+                        let text = run_text(run);
+                        if !text.is_empty() {
+                            spans.push(Span {
+                                text,
+                                size: size_pt * px_per_pt,
+                                color,
+                                bold,
+                            });
+                        }
+                    }
+                    let align = element
+                        .child("pPr")
+                        .and_then(|ppr| ppr.child("jc"))
+                        .and_then(|s| s.attr_local("val"));
+                    let max_size = spans
+                        .iter()
+                        .map(|s| s.size)
+                        .fold(base_pt * px_per_pt, f32::max);
+                    let line_h = max_size * 1.35;
+                    if spans.is_empty() {
+                        y += line_h * 0.6;
+                    } else {
+                        let canvas_probe = pages.last().unwrap();
+                        let lines = canvas_probe.layout_spans(&spans, content_w);
+                        for line in lines {
+                            need!(line_h);
+                            let canvas = pages.last_mut().unwrap();
+                            let lw = canvas.spans_width(&line);
+                            let lx = match align {
+                                Some("center") => margin + (content_w - lw) / 2.0,
+                                Some("right") => margin + content_w - lw,
+                                _ => margin,
+                            };
+                            let asc = canvas.ascent(max_size, base_bold);
+                            canvas.draw_spans_line(&line, lx, y + asc);
+                            y += line_h;
+                        }
+                        y += line_h * 0.3;
+                    }
+                    if forced_break {
+                        new_page!();
+                    }
+                }
+                "tbl" => {
+                    let rows = element.children_named("tr");
+                    let cols = rows
+                        .first()
+                        .map(|tr| tr.children_named("tc").len())
+                        .unwrap_or(0)
+                        .max(1);
+                    let col_w = content_w / cols as f32;
+                    let row_h = 30.0f32;
+                    let font = 11.0 * px_per_pt;
+                    for tr in rows {
+                        need!(row_h);
+                        let canvas = pages.last_mut().unwrap();
+                        for (ci, tc) in tr.children_named("tc").iter().enumerate() {
+                            let cx = margin + col_w * ci as f32;
+                            canvas.stroke_rect(cx, y, col_w, row_h, GRID);
+                            let text = tc.text_content();
+                            canvas.draw_text(&text, cx + 6.0, y + row_h - 10.0, font, BLACK, false);
+                        }
+                        y += row_h;
+                    }
+                    y += 10.0;
+                }
+                _ => {}
+            }
+        }
+        pages.iter().map(|c| c.png()).collect()
+    }
+
+    fn dump(&mut self) -> Result<serde_json::Value> {
+        let body = self.body()?.clone();
+        let mut ops = Vec::new();
+        let mut tbl_count = 0usize;
+        let mut p_count = 0usize;
+        for element in body.elements() {
+            match element.local_name() {
+                "p" => {
+                    p_count += 1;
+                    // Image paragraphs replay as `add image` with the bytes
+                    // embedded (srcdata).
+                    if let Some(mut props) = self.dump_image_paragraph(element)? {
+                        if let Some(jc) = element
+                            .child("pPr")
+                            .and_then(|ppr| ppr.child("jc"))
+                            .and_then(|s| s.attr_local("val"))
+                        {
+                            props.insert("align".into(), json!(jc));
+                        }
+                        ops.push(json!({
+                            "command": "add", "parent": "/body",
+                            "type": "image", "props": props,
+                        }));
+                        continue;
+                    }
                     let mut props = serde_json::Map::new();
-                    props.insert("text".into(), json!(paragraph_text(element)));
                     if let Some(ppr) = element.child("pPr") {
                         if let Some(style) =
                             ppr.child("pStyle").and_then(|s| s.attr_local("val"))
@@ -1402,22 +1990,42 @@ impl Handler for Docx {
                             props.insert("align".into(), json!(jc));
                         }
                     }
-                    // First run's formatting as a paragraph-level approximation.
-                    if let Some(rpr) = element
-                        .elements()
-                        .find(|e| e.local_name() == "r")
-                        .and_then(|r| r.child("rPr"))
-                    {
-                        let mut info = NodeInfo::new("", "run");
-                        describe_rpr(rpr, &mut info);
-                        for (k, v) in info.attributes {
-                            props.insert(k, json!(v));
+                    let runs: Vec<&XmlElement> =
+                        element.elements().filter(|e| e.local_name() == "r").collect();
+                    let uniform = runs.len() <= 1
+                        || runs.windows(2).all(|w| w[0].child("rPr") == w[1].child("rPr"));
+                    if uniform {
+                        props.insert("text".into(), json!(paragraph_text(element)));
+                        if let Some(rpr) = runs.first().and_then(|r| r.child("rPr")) {
+                            for (k, v) in rpr_props(rpr) {
+                                props.insert(k, json!(v));
+                            }
+                        }
+                        ops.push(json!({
+                            "command": "add", "parent": "/body",
+                            "type": "paragraph", "props": props,
+                        }));
+                    } else {
+                        // Mixed formatting: empty paragraph + one run op each.
+                        ops.push(json!({
+                            "command": "add", "parent": "/body",
+                            "type": "paragraph", "props": props,
+                        }));
+                        for run in runs {
+                            let mut rprops = serde_json::Map::new();
+                            rprops.insert("text".into(), json!(run_text(run)));
+                            if let Some(rpr) = run.child("rPr") {
+                                for (k, v) in rpr_props(rpr) {
+                                    rprops.insert(k, json!(v));
+                                }
+                            }
+                            ops.push(json!({
+                                "command": "add",
+                                "parent": format!("/body/p[{p_count}]"),
+                                "type": "run", "props": rprops,
+                            }));
                         }
                     }
-                    ops.push(json!({
-                        "command": "add", "parent": "/body",
-                        "type": "paragraph", "props": props,
-                    }));
                 }
                 "tbl" => {
                     tbl_count += 1;

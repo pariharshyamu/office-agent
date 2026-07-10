@@ -130,4 +130,25 @@ impl Package {
     pub fn remove_part(&mut self, name: &str) {
         self.parts.remove(name);
     }
+
+    /// Ensure `[Content_Types].xml` has an Override for `part`.
+    pub fn add_override(&mut self, part: &str, content_type: &str) -> Result<()> {
+        let mut ct = self.xml("[Content_Types].xml")?;
+        let part_name = format!("/{part}");
+        let exists = ct
+            .children_named("Override")
+            .iter()
+            .any(|o| o.attr_local("PartName") == Some(part_name.as_str()));
+        if !exists {
+            ct.push(xml::el(
+                "Override",
+                &[
+                    ("PartName", part_name.as_str()),
+                    ("ContentType", content_type),
+                ],
+            ));
+            self.put_xml("[Content_Types].xml", &ct)?;
+        }
+        Ok(())
+    }
 }

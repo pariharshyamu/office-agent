@@ -117,7 +117,7 @@ fn run_command_line(command: &str) -> (String, bool) {
 
 /// Minimal shell-style splitter: whitespace-separated, single/double quotes
 /// group words, backslash escapes inside double quotes and bare words.
-fn shell_split(input: &str) -> Result<Vec<String>> {
+pub(crate) fn shell_split(input: &str) -> Result<Vec<String>> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
