@@ -81,19 +81,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Note: not "assets" — that is the repo directory with the embedded
+      # fonts, which would otherwise get attached to the release too.
       - uses: actions/download-artifact@v4
         with:
-          path: assets
+          path: dist
           merge-multiple: true
 
       - name: Attach installer scripts
-        run: cp install.sh install.ps1 assets/
+        run: cp install.sh install.ps1 dist/
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: assets/*
+          files: dist/*
           generate_release_notes: true
           body: |
             officecli — a Rust implementation of OfficeCLI: a command-line
