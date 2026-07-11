@@ -153,6 +153,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Duplicate an element (slide, sheet, row, paragraph, table, shape)
+    Copy {
+        file: PathBuf,
+        path: String,
+        /// Target position (meaning depends on the element kind)
+        #[arg(long, conflicts_with_all = ["before", "after"])]
+        index: Option<usize>,
+        #[arg(long, conflicts_with = "after")]
+        before: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a cell range as CSV (xlsx)
+    Export {
+        file: PathBuf,
+        /// Range like 'Sheet1!A1:C9' or 'A1:C9' (default: the used range)
+        #[arg(long)]
+        range: Option<String>,
+        /// Sheet name (default: the first sheet)
+        #[arg(long)]
+        sheet: Option<String>,
+        /// Write to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove an element by path
     Remove {
         file: PathBuf,
@@ -394,6 +423,39 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             let report = handler.swap(&path1, &path2)?;
             handler.save(&file)?;
             done(report, json)
+        }
+        Command::Copy {
+            file,
+            path,
+            index,
+            before,
+            after,
+            json,
+        } => {
+            let pos = position(index, before, after);
+            let mut handler = open_handler(&file)?;
+            let report = handler.copy_el(&path, &pos)?;
+            handler.save(&file)?;
+            done(report, json)
+        }
+        Command::Export {
+            file,
+            range,
+            sheet,
+            output,
+            json,
+        } => {
+            let mut handler = open_handler(&file)?;
+            let csv = handler.export_csv(sheet.as_deref(), range.as_deref())?;
+            if let Some(out_path) = output {
+                std::fs::write(&out_path, &csv)
+                    .with_context(|| format!("cannot write {}", out_path.display()))?;
+                return done(
+                    Report::message(format!("wrote CSV to {}", out_path.display())),
+                    json,
+                );
+            }
+            done(Report::Text(csv), json)
         }
         Command::Remove { file, path, json } => {
             let mut handler = open_handler(&file)?;

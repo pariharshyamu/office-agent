@@ -657,3 +657,218 @@ fn image_srcdata_dump_roundtrip() {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     assert!(zip.by_name("word/media/image1.png").is_ok());
 }
+
+#[test]
+fn dates_formats_and_csv() {
+    let dir = temp_dir("datescsv");
+    ok(&dir, &["create", "d.xlsx"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A1", "--prop", "value=2026-07-10"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A2", "--prop", "value=0.185", "--prop", "format=0.00%"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A3", "--prop", "value=2026-07-10", "--prop", "type=string"]);
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/A1", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["data"]["results"][0]["text"], "2026-07-10");
+    assert_eq!(v["data"]["results"][0]["attributes"]["type"], "date");
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/A3", "--json"]);
+    assert!(json.contains("\"type\": \"string\""), "{json}");
+    // The stored value is a serial number, not a string.
+    let bytes = std::fs::read(dir.join("d.xlsx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut sheet = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/worksheets/sheet1.xml").unwrap(), &mut sheet).unwrap();
+    assert!(sheet.contains("<v>46213</v>"), "{sheet}");
+
+    // CSV round trip.
+    std::fs::write(dir.join("in.csv"), "Name,When\n\"A, B\",2026-01-02\n").unwrap();
+    ok(&dir, &["create", "c.xlsx"]);
+    ok(&dir, &["add", "c.xlsx", "/Sheet1", "--type", "csv", "--prop", "src=in.csv"]);
+    let csv = ok(&dir, &["export", "c.xlsx"]);
+    assert!(csv.contains("\"A, B\",2026-01-02"), "{csv}");
+}
+
+#[test]
+fn hyperlinks_everywhere() {
+    let dir = temp_dir("links");
+    ok(&dir, &["create", "l.docx"]);
+    ok(&dir, &["add", "l.docx", "/body", "--type", "paragraph", "--prop", "text=See "]);
+    ok(&dir, &[
+        "add", "l.docx", "/body/p[1]", "--type", "hyperlink",
+        "--prop", "url=https://example.com", "--prop", "text=docs",
+    ]);
+    let json = ok(&dir, &["get", "l.docx", "/body/p[1]", "--depth", "1", "--json"]);
+    assert!(json.contains("https://example.com"), "{json}");
+
+    ok(&dir, &["create", "l.xlsx"]);
+    ok(&dir, &["set", "l.xlsx", "/Sheet1/A1", "--prop", "value=Home", "--prop", "url=https://example.org"]);
+    let bytes = std::fs::read(dir.join("l.xlsx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut sheet = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/worksheets/sheet1.xml").unwrap(), &mut sheet).unwrap();
+    assert!(sheet.contains("<hyperlinks>"), "{sheet}");
+
+    ok(&dir, &["create", "l.pptx"]);
+    ok(&dir, &["add", "l.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "l.pptx", "/slide[1]", "--type", "shape",
+        "--prop", "text=Visit", "--prop", "url=https://example.net", "--prop", "y=3in",
+    ]);
+    let bytes = std::fs::read(dir.join("l.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut rels = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/_rels/slide1.xml.rels").unwrap(), &mut rels).unwrap();
+    assert!(rels.contains("https://example.net") && rels.contains("External"), "{rels}");
+}
+
+#[test]
+fn lists_in_docx_and_pptx() {
+    let dir = temp_dir("lists");
+    ok(&dir, &["create", "r.docx"]);
+    ok(&dir, &[
+        "add", "r.docx", "/body", "--type", "list",
+        "--prop", r"items=One\nTwo\n\tNested",
+    ]);
+    ok(&dir, &[
+        "add", "r.docx", "/body", "--type", "list", "--prop", "kind=number",
+        "--prop", r"items=First\nSecond",
+    ]);
+    let text = ok(&dir, &["view", "r.docx", "text"]);
+    assert!(text.contains("• One"), "{text}");
+    assert!(text.contains("  • Nested"), "{text}");
+    assert!(text.contains("2. Second"), "{text}");
+    let json = ok(&dir, &["get", "r.docx", "/body/p[3]", "--json"]);
+    assert!(json.contains("\"list\": \"bullet\"") && json.contains("\"level\": \"1\""), "{json}");
+    // list=none strips the numbering.
+    ok(&dir, &["set", "r.docx", "/body/p[1]", "--prop", "list=none"]);
+    let text = ok(&dir, &["view", "r.docx", "text"]);
+    assert!(text.contains("\nOne") || text.starts_with("One"), "{text}");
+
+    ok(&dir, &["create", "d.pptx"]);
+    ok(&dir, &["add", "d.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "d.pptx", "/slide[1]", "--type", "shape", "--prop", "list=bullet",
+        "--prop", r"text=Alpha\n\tBeta", "--prop", "y=2in",
+    ]);
+    let bytes = std::fs::read(dir.join("d.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut slide = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/slide1.xml").unwrap(), &mut slide).unwrap();
+    assert!(slide.contains("buChar") && slide.contains("lvl=\"1\""), "{slide}");
+}
+
+#[test]
+fn speaker_notes_lifecycle() {
+    let dir = temp_dir("notes");
+    ok(&dir, &["create", "n.pptx"]);
+    ok(&dir, &["add", "n.pptx", "/", "--type", "slide", "--prop", "title=A", "--prop", "notes=First take"]);
+    ok(&dir, &["set", "n.pptx", "/slide[1]", "--prop", "notes=Revised"]);
+    let notes = ok(&dir, &["view", "n.pptx", "notes"]);
+    assert!(notes.contains("Revised") && !notes.contains("First take"), "{notes}");
+    // Dump replays notes.
+    let dump = ok(&dir, &["dump", "n.pptx"]);
+    assert!(dump.contains("\"notes\": \"Revised\""), "{dump}");
+    let bytes = std::fs::read(dir.join("n.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("ppt/notesSlides/notesSlide1.xml").is_ok());
+    assert!(zip.by_name("ppt/notesMasters/notesMaster1.xml").is_ok());
+}
+
+#[test]
+fn copy_duplicates_elements() {
+    let dir = temp_dir("copy");
+    ok(&dir, &["create", "c.docx"]);
+    ok(&dir, &["add", "c.docx", "/body", "--type", "paragraph", "--prop", "text=Row"]);
+    ok(&dir, &["copy", "c.docx", "/body/p[1]"]);
+    let text = ok(&dir, &["view", "c.docx", "text"]);
+    assert_eq!(text.matches("Row").count(), 2, "{text}");
+
+    ok(&dir, &["create", "c.pptx"]);
+    ok(&dir, &["add", "c.pptx", "/", "--type", "slide", "--prop", "title=S", "--prop", "notes=talk"]);
+    ok(&dir, &["copy", "c.pptx", "/slide[1]"]);
+    let outline = ok(&dir, &["view", "c.pptx", "outline"]);
+    assert_eq!(outline.matches("Slide ").count(), 2, "{outline}");
+    let notes = ok(&dir, &["view", "c.pptx", "notes"]);
+    assert_eq!(notes.matches("talk").count(), 2, "{notes}");
+
+    ok(&dir, &["create", "c.xlsx"]);
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A1", "--prop", "value=x", "--prop", "url=https://example.com"]);
+    ok(&dir, &["copy", "c.xlsx", "/Sheet1"]);
+    let outline = ok(&dir, &["view", "c.xlsx", "outline"]);
+    assert!(outline.contains("Sheet1 (2)"), "{outline}");
+    // The copy carries the sheet rels, so its hyperlink r:id resolves.
+    let bytes = std::fs::read(dir.join("c.xlsx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("xl/worksheets/_rels/sheet2.xml.rels").is_ok());
+}
+
+/// Rewrite one zip entry in place (simulating Word/PowerPoint-authored XML).
+fn rewrite_zip_entry(path: &Path, entry: &str, from: &str, to: &str) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut items: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+        items.push((f.name().to_string(), buf));
+    }
+    let item = items.iter_mut().find(|(n, _)| n == entry).unwrap();
+    let text = String::from_utf8(item.1.clone()).unwrap();
+    assert!(text.contains(from), "pattern not found in {entry}");
+    item.1 = text.replace(from, to).into_bytes();
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in &items {
+            writer.start_file(name, options).unwrap();
+            std::io::Write::write_all(&mut writer, data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    std::fs::write(path, cursor.into_inner()).unwrap();
+}
+
+#[test]
+fn theme_colors_resolve() {
+    let dir = temp_dir("theme");
+    ok(&dir, &["create", "t.pptx"]);
+    ok(&dir, &["add", "t.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &["add", "t.pptx", "/slide[1]", "--type", "shape", "--prop", "text=Box", "--prop", "fill=FF0000", "--prop", "y=3in"]);
+    rewrite_zip_entry(
+        &dir.join("t.pptx"),
+        "ppt/slides/slide1.xml",
+        r#"<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>"#,
+        r#"<a:solidFill><a:schemeClr val="accent1"/></a:solidFill>"#,
+    );
+    let dump = ok(&dir, &["dump", "t.pptx"]);
+    // accent1 in the default theme is 4472C4.
+    assert!(dump.contains("\"fill\": \"4472C4\""), "{dump}");
+}
+
+#[test]
+fn sdt_content_controls_are_transparent() {
+    let dir = temp_dir("sdt");
+    ok(&dir, &["create", "s.docx"]);
+    ok(&dir, &["add", "s.docx", "/body", "--type", "paragraph", "--prop", "text=Before"]);
+    ok(&dir, &["add", "s.docx", "/body", "--type", "paragraph", "--prop", "text=Wrapped"]);
+    ok(&dir, &["add", "s.docx", "/body", "--type", "paragraph", "--prop", "text=After"]);
+    let target = r#"<w:p><w:r><w:t xml:space="preserve">Wrapped</w:t></w:r></w:p>"#;
+    rewrite_zip_entry(
+        &dir.join("s.docx"),
+        "word/document.xml",
+        target,
+        &format!("<w:sdt><w:sdtPr><w:id w:val=\"1\"/></w:sdtPr><w:sdtContent>{target}</w:sdtContent></w:sdt>"),
+    );
+    // Addressing, editing, and views all look through the control.
+    let json = ok(&dir, &["get", "s.docx", "/body/p[2]", "--json"]);
+    assert!(json.contains("Wrapped"), "{json}");
+    ok(&dir, &["set", "s.docx", "/body/p[2]", "--prop", "text=Edited"]);
+    let text = ok(&dir, &["view", "s.docx", "text"]);
+    assert_eq!(text.trim(), "Before\nEdited\nAfter", "{text}");
+    // The wrapper survives the edit.
+    let bytes = std::fs::read(dir.join("s.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut doc = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut doc).unwrap();
+    assert!(doc.contains("<w:sdt>") && doc.contains("Edited"), "{doc}");
+}

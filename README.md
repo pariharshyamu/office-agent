@@ -109,7 +109,10 @@ set <file> <path> [--prop k=v ...] [--json]      modify properties
     [--find TEXT [--replace TEXT]]               find/format or find/replace
 move <file> <path> [--to P] [--index N|...]      reposition an element
 swap <file> <path1> <path2>                      exchange two elements
+copy <file> <path> [--index N]                   duplicate slide/sheet/row/
+                                                 paragraph/table/shape
 remove <file> <path> [--json]                    delete an element
+export <file> [--range R] [--sheet S] [-o F]     cell range as CSV (xlsx)
 dump <file>                                      replayable batch JSON
 batch <file> [--commands JSON | --input F]       many ops, one save cycle
 validate <file> [--json]                         package sanity check
@@ -131,6 +134,7 @@ Paths are 1-based; `--index` is 0-based (array convention), except
 | Colors | `FF0000`, `#FF0000`, `red`, `rgb(255,0,0)` |
 | Lengths | `2cm`, `25mm`, `1in`, `72pt`, `96px`, raw EMU (`914400` = 1 inch) |
 | Font sizes | `24` or `24pt` |
+| Dates | `2026-07-10`, `2026-07-10 14:30`, `14:30:00` (xlsx: real date cells) |
 | Booleans | `true` / `false` |
 | Text | `\n` becomes a line break (new paragraph in pptx), `\t` a tab |
 
@@ -183,6 +187,73 @@ officecli add deck.pptx '/slide[1]' --type image \
 PNG, JPEG, and GIF; intrinsic size is read from the file (96 dpi) and the
 aspect ratio is preserved when only one of `w`/`h` is given. Bytes can be
 passed inline with `--prop srcdata=BASE64` (used by `dump` for round-trips).
+
+### Lists
+
+```bash
+officecli add report.docx /body --type list --prop items='First\nSecond\n\tNested detail'
+officecli add report.docx /body --type list --prop kind=number --prop items='Step 1\nStep 2'
+officecli set report.docx '/body/p[4]' --prop list=bullet          # or list=none
+officecli add deck.pptx '/slide[1]' --type shape --prop list=bullet \
+    --prop text='Point one\n\tSub-point\nPoint two'
+```
+
+`\n` separates items; leading `\t`s select deeper levels (docx: real
+`numbering.xml` definitions; pptx: `buChar`/`buAutoNum` with hanging
+indents). Views, screenshots, and `dump` render and replay markers.
+
+### Dates, number formats, CSV (xlsx)
+
+```bash
+officecli set data.xlsx /Sheet1/A1 --prop value=2026-07-10        # real date cell
+officecli set data.xlsx /Sheet1/B1 --prop value=0.185 --prop format=0.00%
+officecli set data.xlsx /Sheet1/C1 --prop value=1234.5 --prop format=currency
+officecli add data.xlsx /Sheet1 --type csv --prop src=input.csv --prop at=A1
+officecli export data.xlsx --range 'Sheet1!A1:C99' -o out.csv
+```
+
+ISO dates/times auto-detect into serial numbers with date formats (openpyxl
+reads them back as `datetime` objects); `type=string` opts out. `format=`
+accepts `date`/`datetime`/`time`/`percent`/`currency`/`integer`/`0.00`/raw
+codes. Date cells read back as ISO strings with `type=date`. CSV import
+auto-types numbers and dates; export quotes RFC 4180-style.
+
+### Hyperlinks
+
+```bash
+officecli add report.docx '/body/p[1]' --type hyperlink --prop url=https://example.com --prop text=docs
+officecli set data.xlsx /Sheet1/A1 --prop value=Home --prop url=https://example.com
+officecli add deck.pptx '/slide[1]' --type shape --prop text="Visit us" --prop url=https://example.com
+```
+
+### Speaker notes (pptx)
+
+```bash
+officecli add deck.pptx / --type slide --prop title=Intro --prop notes="Keep it under 2 minutes"
+officecli set deck.pptx '/slide[1]' --prop notes="Revised talk track"
+officecli view deck.pptx notes
+```
+
+Notes survive `copy`, replay through `dump`, and read back via python-pptx.
+
+### Copy
+
+```bash
+officecli copy deck.pptx '/slide[1]'          # duplicate (content, background, notes)
+officecli copy deck.pptx '/slide[1]/shape[2]'
+officecli copy data.xlsx /Sheet1              # → "Sheet1 (2)"
+officecli copy data.xlsx '/Sheet1/row[2]'     # duplicate below, shifts rows
+officecli copy report.docx '/body/p[1]'
+```
+
+### Theme colors and Word content controls
+
+Documents authored in Office use theme references (`schemeClr accent1`,
+tints, `lumMod`/`lumOff`) rather than literal colors; officecli resolves
+them through `theme1.xml` in `get`/`view html`/`screenshot`/`dump`, so
+corporate decks keep their palette. Word content controls (`w:sdt`) are
+transparent: paragraphs inside them address as plain `/body/p[N]` paths and
+the wrappers are preserved on save.
 
 ### Charts
 
@@ -334,29 +405,32 @@ failure.
 ## What's implemented per format
 
 **Word (.docx)** — paragraphs (text, style Normal/Title/Heading1–3, align),
-runs (bold/italic/underline/size/color/font/highlight), tables (create,
-add row, set cell text + formatting), page breaks, images, comments (add/
-list/remove), footnotes, TOC and fields, insert before/after/at index,
-whole-scope find/replace and find+format with run splitting,
-outline/text/stats/html/comments/screenshot views.
+runs (bold/italic/underline/size/color/font/highlight), bulleted/numbered
+lists with nesting, hyperlinks, tables (create, add row, set cell text +
+formatting), page breaks, images, comments (add/list/remove), footnotes,
+TOC and fields, copy, transparent `w:sdt` content controls, insert
+before/after/at index, whole-scope find/replace and find+format with run
+splitting, outline/text/stats/html/comments/screenshot views.
 
 **Excel (.xlsx)** — cells created on demand via `set` (strings, numbers,
-booleans, formulas auto-detected by `=`), shared-string-aware reads,
-cell styling (bold/italic/color/size/font/fill) through a styles-table
-manager, sheets (add/rename/remove), rows and columns (insert/remove with
-shifts and workbook-wide formula-reference rewriting), charts over live
-ranges, computed pivot summaries, ranges on `get`, `$Sheet:A1` addressing,
-find/replace over string cells, grid/outline/stats/html/screenshot views.
-Formulas are stored uncalculated with `fullCalcOnLoad` so Excel/LibreOffice
-recalculate on open.
+booleans, real dates/times, formulas auto-detected by `=`), number formats
+(percent/currency/custom codes), hyperlinks, CSV import/export,
+shared-string-aware reads, cell styling (bold/italic/underline/color/size/
+font/fill) through a styles-table manager, sheets (add/rename/remove/copy),
+rows and columns (insert/remove/copy with shifts and workbook-wide
+formula-reference rewriting), charts over live ranges, computed pivot
+summaries, ranges on `get`, `$Sheet:A1` addressing, find/replace over
+string cells, grid/outline/stats/html/screenshot views. Formulas are stored
+uncalculated with `fullCalcOnLoad` so Excel/LibreOffice recalculate on open.
 
-**PowerPoint (.pptx)** — slides (add with `title`/`background`, position
-with `--index/--before/--after`, remove with full relationship cleanup),
-textbox shapes (text, x/y/w/h in any length unit, size/color/bold/italic/
-font/align/fill/name), images, charts, slide transitions, entrance
-animations, shape addressing by position, `@name=`, or `@id=`, slide
-background, find/replace across slides, outline/text/stats/html/screenshot
-views.
+**PowerPoint (.pptx)** — slides (add with `title`/`background`/`notes`,
+position with `--index/--before/--after`, copy with notes, remove with full
+relationship cleanup), textbox shapes (text, x/y/w/h in any length unit,
+size/color/bold/italic/font/align/fill/name/url, bullet/numbered lists with
+levels), speaker notes, images, charts, slide transitions, entrance
+animations, theme-color resolution (schemeClr + lumMod/lumOff), shape
+addressing by position, `@name=`, or `@id=`, slide background, find/replace
+across slides, outline/text/stats/html/notes/screenshot views.
 
 Blank documents created by `create` open without repair prompts in Word,
 Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
@@ -370,12 +444,14 @@ composite; JPEG/GIF and charts render as placeholders; no italics or
 justified text); pivots are computed summary tables, not native interactive
 PivotTables; pptx charts embed cached data without a linked workbook, so
 PowerPoint's "Edit Data" won't open a sheet; animations cover click-triggered
-entrance effects only; `dump` is a high-fidelity content replay, not a
-byte-identical round-trip. Not implemented: scatter charts, docx charts,
-xlsx cell comments, headers/footers, and PowerPoint motion-path animations.
-The architecture (lossless XML DOM over the zip package, one handler per
-format behind a common trait) is designed so these can be added
-incrementally.
+entrance effects only; theme-color transforms (lumMod/lumOff/tint/shade) are
+per-channel approximations of Office's HSL math; formula evaluation is not
+performed (values compute on open); `dump` is a high-fidelity content
+replay, not a byte-identical round-trip. Not implemented: scatter charts,
+docx charts, xlsx cell comments, headers/footers, formula evaluation, and
+PowerPoint motion-path animations. The architecture (lossless XML DOM over
+the zip package, one handler per format behind a common trait) is designed
+so these can be added incrementally.
 
 ## Architecture
 

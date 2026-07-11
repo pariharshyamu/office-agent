@@ -21,6 +21,11 @@ const SLIDE_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const SLIDE_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+const NOTES_SLIDE_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
+const NOTES_MASTER_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster";
+const NOTES_MASTER_PART: &str = "ppt/notesMasters/notesMaster1.xml";
 
 struct Slide {
     part: String,
@@ -41,6 +46,106 @@ pub struct Pptx {
     presentation: XmlElement,
     rels: XmlElement,
     slides: Vec<Slide>,
+    /// Theme palette: scheme color name (dk1, accent1, ...) → RRGGBB.
+    theme: std::collections::HashMap<String, String>,
+}
+
+/// Load the clrScheme of the first theme part into name → RRGGBB.
+fn load_theme_colors(pkg: &Package) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let part = if pkg.has_part("ppt/theme/theme1.xml") {
+        Some("ppt/theme/theme1.xml".to_string())
+    } else {
+        pkg.part_names()
+            .find(|p| p.starts_with("ppt/theme/theme"))
+            .map(|p| p.to_string())
+    };
+    let Some(part) = part else { return map };
+    let Ok(theme) = pkg.xml(&part) else { return map };
+    let Some(scheme) = theme
+        .child("themeElements")
+        .and_then(|te| te.child("clrScheme"))
+    else {
+        return map;
+    };
+    for entry in scheme.elements() {
+        let color = entry
+            .child("srgbClr")
+            .and_then(|c| c.attr_local("val"))
+            .or_else(|| entry.child("sysClr").and_then(|c| c.attr_local("lastClr")));
+        if let Some(color) = color {
+            map.insert(entry.local_name().to_string(), color.to_uppercase());
+        }
+    }
+    map
+}
+
+/// Apply DrawingML color transforms (lumMod/lumOff/shade/tint) approximately.
+fn apply_color_mods(hex: &str, clr: &XmlElement) -> String {
+    let Ok(n) = u32::from_str_radix(hex, 16) else {
+        return hex.to_string();
+    };
+    let mut rgb = [
+        ((n >> 16) & 0xFF) as f64,
+        ((n >> 8) & 0xFF) as f64,
+        (n & 0xFF) as f64,
+    ];
+    for m in clr.elements() {
+        let val = m
+            .attr_local("val")
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v / 100_000.0);
+        let Some(val) = val else { continue };
+        for c in rgb.iter_mut() {
+            match m.local_name() {
+                "lumMod" | "shade" => *c *= val,
+                "lumOff" => *c += 255.0 * val,
+                "tint" => *c = *c * val + 255.0 * (1.0 - val),
+                _ => {}
+            }
+        }
+    }
+    format!(
+        "{:02X}{:02X}{:02X}",
+        rgb[0].clamp(0.0, 255.0) as u8,
+        rgb[1].clamp(0.0, 255.0) as u8,
+        rgb[2].clamp(0.0, 255.0) as u8
+    )
+}
+
+/// Resolve a fill-holding element (spPr, bgPr, rPr) to a hex color:
+/// literal srgbClr or theme schemeClr (with tx/bg aliases).
+fn resolve_fill_color(
+    container: &XmlElement,
+    theme: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let fill = container.child("solidFill")?;
+    resolve_color_choice(fill, theme)
+}
+
+/// Resolve the color child of any DrawingML color container.
+fn resolve_color_choice(
+    parent: &XmlElement,
+    theme: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(c) = parent.child("srgbClr") {
+        let hex = c.attr_local("val")?.to_uppercase();
+        return Some(apply_color_mods(&hex, c));
+    }
+    if let Some(c) = parent.child("schemeClr") {
+        let name = c.attr_local("val")?;
+        // clrMap aliases used on slides.
+        let mapped = match name {
+            "tx1" => "dk1",
+            "bg1" => "lt1",
+            "tx2" => "dk2",
+            "bg2" => "lt2",
+            other => other,
+        };
+        let base = theme.get(mapped)?;
+        return Some(apply_color_mods(base, c));
+    }
+    None
 }
 
 impl Pptx {
@@ -77,12 +182,26 @@ impl Pptx {
                 });
             }
         }
+        let theme = load_theme_colors(&pkg);
         Ok(Pptx {
             pkg,
             presentation,
             rels,
             slides,
+            theme,
         })
+    }
+
+    /// Slide background color, resolving theme references (bgPr and bgRef).
+    fn slide_bg_color(&self, slide: &Slide) -> Option<String> {
+        let bg = slide.xml.child("cSld")?.child("bg")?;
+        if let Some(bgpr) = bg.child("bgPr") {
+            return resolve_fill_color(bgpr, &self.theme);
+        }
+        if let Some(bgref) = bg.child("bgRef") {
+            return resolve_color_choice(bgref, &self.theme);
+        }
+        None
     }
 
     fn slide_index(&self, seg: &Segment) -> Result<usize> {
@@ -435,6 +554,148 @@ impl Pptx {
             tree.push(sp);
         }
         Ok(slide_pos)
+    }
+
+    /// Notes slide part linked from a slide, if any.
+    fn notes_part_for_slide(slide: &Slide) -> Option<String> {
+        slide
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Type") == Some(NOTES_SLIDE_REL_TYPE))
+            .and_then(|r| r.attr_local("Target"))
+            .map(|t| resolve_target("ppt/slides", t))
+    }
+
+    /// Speaker notes text of a slide, if any.
+    fn notes_text(&self, slide: &Slide) -> Option<String> {
+        let part = Self::notes_part_for_slide(slide)?;
+        let xml = self.pkg.xml(&part).ok()?;
+        let tree = xml.child("cSld")?.child("spTree")?;
+        for sp in tree.children_named("sp") {
+            let is_body = sp
+                .child("nvSpPr")
+                .and_then(|nv| nv.child("nvPr"))
+                .and_then(|n| n.child("ph"))
+                .map(|ph| ph.attr_local("type") == Some("body"))
+                .unwrap_or(false);
+            if is_body {
+                let text = shape_text(sp);
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+        None
+    }
+
+    /// The notes master (and its theme) exist once per package.
+    fn ensure_notes_master(&mut self) -> Result<()> {
+        if self.pkg.has_part(NOTES_MASTER_PART) {
+            return Ok(());
+        }
+        let theme_num = self
+            .pkg
+            .part_names()
+            .filter_map(|p| {
+                p.strip_prefix("ppt/theme/theme")
+                    .and_then(|s| s.strip_suffix(".xml"))
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let theme_part = format!("ppt/theme/theme{theme_num}.xml");
+        self.pkg
+            .put_raw(&theme_part, crate::templates::pptx_theme().as_bytes().to_vec());
+        self.pkg
+            .add_override(&theme_part, "application/vnd.openxmlformats-officedocument.theme+xml")?;
+        self.pkg.put_raw(
+            NOTES_MASTER_PART,
+            crate::templates::pptx_notes_master().into_bytes(),
+        );
+        self.pkg.add_override(
+            NOTES_MASTER_PART,
+            "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml",
+        )?;
+        let master_rels = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme{theme_num}.xml"/></Relationships>"#
+        );
+        self.pkg.put_raw(
+            "ppt/notesMasters/_rels/notesMaster1.xml.rels",
+            master_rels.into_bytes(),
+        );
+
+        let rid = crate::media::add_relationship(
+            &mut self.rels,
+            NOTES_MASTER_REL_TYPE,
+            "notesMasters/notesMaster1.xml",
+        );
+        if self.presentation.child("notesMasterIdLst").is_none() {
+            let mut lst = XmlElement::new("p:notesMasterIdLst");
+            lst.push(el("p:notesMasterId", &[("r:id", rid.as_str())]));
+            // Schema order: right after sldMasterIdLst.
+            let at = self
+                .presentation
+                .children
+                .iter()
+                .position(|n| {
+                    matches!(n, XmlNode::Element(e) if e.local_name() == "sldMasterIdLst")
+                })
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            self.presentation.children.insert(at, XmlNode::Element(lst));
+        }
+        Ok(())
+    }
+
+    /// Create or replace a slide's speaker notes.
+    fn set_notes(&mut self, slide_idx: usize, text: &str) -> Result<()> {
+        self.ensure_notes_master()?;
+        let part = match Self::notes_part_for_slide(&self.slides[slide_idx]) {
+            Some(part) => part,
+            None => {
+                let n = self
+                    .pkg
+                    .part_names()
+                    .filter_map(|p| {
+                        p.strip_prefix("ppt/notesSlides/notesSlide")
+                            .and_then(|s| s.strip_suffix(".xml"))
+                            .and_then(|n| n.parse::<u32>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let part = format!("ppt/notesSlides/notesSlide{n}.xml");
+                self.pkg.add_override(
+                    &part,
+                    "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml",
+                )?;
+                let slide_file = self.slides[slide_idx]
+                    .part
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let rels = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{NOTES_MASTER_REL_TYPE}" Target="../notesMasters/notesMaster1.xml"/><Relationship Id="rId2" Type="{SLIDE_REL_TYPE}" Target="../slides/{slide_file}"/></Relationships>"#
+                );
+                self.pkg.put_raw(
+                    &format!("ppt/notesSlides/_rels/notesSlide{n}.xml.rels"),
+                    rels.into_bytes(),
+                );
+                crate::media::add_relationship(
+                    &mut self.slides[slide_idx].rels,
+                    NOTES_SLIDE_REL_TYPE,
+                    &format!("../notesSlides/notesSlide{n}.xml"),
+                );
+                part
+            }
+        };
+        self.pkg.put_xml(&part, &build_notes_xml(text))?;
+        Ok(())
     }
 
     /// Insert a chart as a graphicFrame. Data comes from props
@@ -928,6 +1189,29 @@ fn solid_fill(color: &str) -> XmlElement {
     fill
 }
 
+/// Attach `a:hlinkClick` to every run in the shape's txBody.
+fn apply_hyperlink(sp: &mut XmlElement, rid: &str) {
+    let Some(tx) = sp.child_mut("txBody") else { return };
+    for p in tx.children.iter_mut().filter_map(|n| n.as_element_mut()) {
+        if p.local_name() != "p" {
+            continue;
+        }
+        for r in p.children.iter_mut().filter_map(|n| n.as_element_mut()) {
+            if r.local_name() != "r" {
+                continue;
+            }
+            let rpr = r.ensure_child("rPr", "a:rPr", true);
+            if rpr.attr("lang").is_none() {
+                rpr.set_attr("lang", "en-US");
+            }
+            rpr.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e) if e.local_name() == "hlinkClick")
+            });
+            rpr.push(el("a:hlinkClick", &[("r:id", rid)]));
+        }
+    }
+}
+
 fn build_run_props(props: &Props) -> Result<Option<XmlElement>> {
     let mut rpr = el("a:rPr", &[("lang", "en-US"), ("dirty", "0")]);
     let mut any = false;
@@ -961,19 +1245,124 @@ fn build_run_props(props: &Props) -> Result<Option<XmlElement>> {
 
 fn build_text_paragraph(line: &str, props: &Props) -> Result<XmlElement> {
     let mut p = XmlElement::new("a:p");
-    if let Some(align) = props.get("align") {
-        let (_, algn) = parse_align(align)?;
-        p.push(el("a:pPr", &[("algn", algn)]));
+    // Leading tabs select the list indent level.
+    let line = line.replace("\\t", "\t");
+    let level = line.chars().take_while(|c| *c == '\t').count().min(8);
+    let text = line.trim_start_matches('\t');
+
+    let list_kind = props
+        .get("list")
+        .map(|k| k.to_ascii_lowercase())
+        .filter(|k| k != "none");
+    let algn = props
+        .get("align")
+        .map(|a| parse_align(a).map(|(_, algn)| algn))
+        .transpose()?;
+    if list_kind.is_some() || algn.is_some() || level > 0 {
+        let mut ppr = XmlElement::new("a:pPr");
+        if let Some(algn) = algn {
+            ppr.set_attr("algn", algn);
+        }
+        if let Some(kind) = &list_kind {
+            if level > 0 {
+                ppr.set_attr("lvl", &level.to_string());
+            }
+            // Hanging indent so wrapped lines align after the marker.
+            let marl = 285_750 + 457_200 * level as i64;
+            ppr.set_attr("marL", &marl.to_string());
+            ppr.set_attr("indent", "-285750");
+            ppr.push(el(
+                "a:buFont",
+                &[("typeface", "Arial"), ("pitchFamily", "34"), ("charset", "0")],
+            ));
+            match kind.as_str() {
+                "bullet" | "bullets" | "ul" => ppr.push(el("a:buChar", &[("char", "•")])),
+                "number" | "numbered" | "decimal" | "ol" => {
+                    ppr.push(el("a:buAutoNum", &[("type", "arabicPeriod")]))
+                }
+                other => bail!("unknown list kind '{other}' (bullet/number/none)"),
+            }
+        } else if level > 0 {
+            ppr.set_attr("lvl", &level.to_string());
+        }
+        p.push(ppr);
     }
     let mut r = XmlElement::new("a:r");
     if let Some(rpr) = build_run_props(props)? {
         r.push(rpr);
     }
     let mut t = XmlElement::new("a:t");
-    t.push_text(line);
+    t.push_text(text);
     r.push(t);
     p.push(r);
     Ok(p)
+}
+
+/// "• " or "N. " for a rendered a:p with bullet properties.
+fn slide_list_marker(p: &XmlElement, counters: &mut std::collections::HashMap<u32, u32>) -> Option<String> {
+    let ppr = p.child("pPr")?;
+    let level: u32 = ppr.attr_local("lvl").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if ppr.child("buChar").is_some() {
+        Some("• ".to_string())
+    } else if ppr.child("buAutoNum").is_some() {
+        let c = counters.entry(level).or_insert(0);
+        *c += 1;
+        Some(format!("{c}. "))
+    } else {
+        None
+    }
+}
+
+/// A complete notesSlide part with the text in the body placeholder.
+fn build_notes_xml(text: &str) -> XmlElement {
+    let mut notes = el(
+        "p:notes",
+        &[
+            ("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+            ("xmlns:r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships"),
+            ("xmlns:p", "http://schemas.openxmlformats.org/presentationml/2006/main"),
+        ],
+    );
+    let mut csld = XmlElement::new("p:cSld");
+    let mut tree = XmlElement::new("p:spTree");
+    let mut nv = XmlElement::new("p:nvGrpSpPr");
+    nv.push(el("p:cNvPr", &[("id", "1"), ("name", "")]));
+    nv.push(XmlElement::new("p:cNvGrpSpPr"));
+    nv.push(XmlElement::new("p:nvPr"));
+    tree.push(nv);
+    tree.push(XmlElement::new("p:grpSpPr"));
+
+    let mut sp = XmlElement::new("p:sp");
+    let mut nvsp = XmlElement::new("p:nvSpPr");
+    nvsp.push(el("p:cNvPr", &[("id", "2"), ("name", "Notes Placeholder 1")]));
+    let mut cnv = XmlElement::new("p:cNvSpPr");
+    cnv.push(el("a:spLocks", &[("noGrp", "1")]));
+    nvsp.push(cnv);
+    let mut nvpr = XmlElement::new("p:nvPr");
+    nvpr.push(el("p:ph", &[("type", "body"), ("idx", "1")]));
+    nvsp.push(nvpr);
+    sp.push(nvsp);
+    sp.push(XmlElement::new("p:spPr"));
+    let mut tx = XmlElement::new("p:txBody");
+    tx.push(XmlElement::new("a:bodyPr"));
+    tx.push(XmlElement::new("a:lstStyle"));
+    for line in text.replace("\\n", "\n").split('\n') {
+        let mut p = XmlElement::new("a:p");
+        let mut r = XmlElement::new("a:r");
+        let mut t = XmlElement::new("a:t");
+        t.push_text(line);
+        r.push(t);
+        p.push(r);
+        tx.push(p);
+    }
+    sp.push(tx);
+    tree.push(sp);
+    csld.push(tree);
+    notes.push(csld);
+    let mut cmo = XmlElement::new("p:clrMapOvr");
+    cmo.push(XmlElement::new("a:masterClrMapping"));
+    notes.push(cmo);
+    notes
 }
 
 fn set_slide_background(slide_xml: &mut XmlElement, color: &str) -> Result<()> {
@@ -1076,6 +1465,17 @@ impl Handler for Pptx {
                     }),
                 })
             }
+            "notes" => {
+                let mut nodes = Vec::new();
+                for (i, slide) in self.slides.iter().enumerate() {
+                    if let Some(text) = self.notes_text(slide) {
+                        let mut info = NodeInfo::new(format!("/slide[{}]", i + 1), "notes");
+                        info.text = Some(text);
+                        nodes.push(info);
+                    }
+                }
+                Ok(Report::Nodes(nodes))
+            }
             "html" => {
                 // Render at 960px wide; 12192000 EMU (16:9 default) → 960px,
                 // which conveniently makes font px = a:rPr sz / 100.
@@ -1094,15 +1494,8 @@ impl Handler for Pptx {
                 let mut out = String::new();
                 for (i, slide) in self.slides.iter().enumerate() {
                     out.push_str(&format!("<div class=\"slide-label\">Slide {}</div>\n", i + 1));
-                    let bg = slide
-                        .xml
-                        .child("cSld")
-                        .and_then(|c| c.child("bg"))
-                        .and_then(|bg| bg.child("bgPr"))
-                        .and_then(|p| p.child("solidFill"))
-                        .and_then(|f| f.child("srgbClr"))
-                        .and_then(|c| c.attr_local("val"));
-                    let bg_css = bg
+                    let bg_css = self
+                        .slide_bg_color(slide)
                         .map(|c| format!("background:#{c};"))
                         .unwrap_or_default();
                     out.push_str(&format!(
@@ -1111,7 +1504,7 @@ impl Handler for Pptx {
                     let tree = Self::sp_tree(slide)?;
                     for &si in &Self::shape_indices(tree) {
                         let e = tree.children[si].as_element().unwrap();
-                        render_shape_html(e, scale, &mut out);
+                        render_shape_html(e, scale, &self.theme, &mut out);
                     }
                     out.push_str("</div>\n");
                 }
@@ -1160,6 +1553,10 @@ impl Handler for Pptx {
                     bail!("slides are added at the root: officecli add file.pptx / --type slide");
                 }
                 let idx = self.add_slide(props, pos)?;
+                if let Some(notes) = props.get("notes") {
+                    let notes = notes.to_string();
+                    self.set_notes(idx, &notes)?;
+                }
                 Ok(Report::Nodes(vec![self.slide_info(idx, 1)?]))
             }
             "shape" | "textbox" | "text" => {
@@ -1169,7 +1566,15 @@ impl Handler for Pptx {
                 let slide_idx = self.slide_index(&dpath.segments[0])?;
                 let tree = Self::sp_tree(&self.slides[slide_idx])?;
                 let id = Self::next_shape_id(tree);
-                let sp = self.build_textbox(id, props)?;
+                let mut sp = self.build_textbox(id, props)?;
+                if let Some(url) = props.get("url") {
+                    let rid = crate::media::add_external_relationship(
+                        &mut self.slides[slide_idx].rels,
+                        crate::media::HYPERLINK_REL_TYPE,
+                        url,
+                    );
+                    apply_hyperlink(&mut sp, &rid);
+                }
                 let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
                 match pos {
                     Position::Append => tree.push(sp),
@@ -1333,8 +1738,13 @@ impl Handler for Pptx {
                 }
                 changed.push(format!("transition={}", props.get("transition").unwrap()));
             }
+            if let Some(notes) = props.get("notes") {
+                let notes = notes.to_string();
+                self.set_notes(slide_idx, &notes)?;
+                changed.push("notes".to_string());
+            }
             if changed.is_empty() {
-                bail!("slide-level set supports --prop background=COLOR and --prop transition=fade|push|... [--prop direction=..] [--prop speed=..] [--prop advance=..]");
+                bail!("slide-level set supports --prop background=COLOR, --prop notes=\"...\", and --prop transition=fade|push|... [--prop direction=..] [--prop speed=..] [--prop advance=..]");
             }
             return Ok(Report::Data {
                 text: format!("slide {}: set {}", slide_idx + 1, changed.join(", ")),
@@ -1368,6 +1778,16 @@ impl Handler for Pptx {
                 delay,
             )?;
         }
+
+        // Hyperlink rel must be created before the shape borrow below.
+        let link_rid = match props.get("url") {
+            Some(url) => Some(crate::media::add_external_relationship(
+                &mut self.slides[slide_idx].rels,
+                crate::media::HYPERLINK_REL_TYPE,
+                url,
+            )),
+            None => None,
+        };
 
         let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
         let sp = tree.children[shape_child_idx]
@@ -1454,6 +1874,9 @@ impl Handler for Pptx {
                 apply_format_to_txbody(tx, props)?;
             }
         }
+        if let Some(rid) = &link_rid {
+            apply_hyperlink(sp, rid);
+        }
 
         let tree = Self::sp_tree(&self.slides[slide_idx])?;
         let e = tree.children[shape_child_idx].as_element().unwrap();
@@ -1473,6 +1896,21 @@ impl Handler for Pptx {
         let slide_idx = self.slide_index(&dpath.segments[0])?;
 
         if dpath.segments.len() == 1 {
+            // Notes slide goes with its slide.
+            if let Some(notes_part) = Self::notes_part_for_slide(&self.slides[slide_idx]) {
+                let notes_rels =
+                    notes_part.replace("ppt/notesSlides/", "ppt/notesSlides/_rels/") + ".rels";
+                let mut ct = self.pkg.xml(CONTENT_TYPES_PART)?;
+                let part_name = format!("/{notes_part}");
+                ct.children.retain(|n| {
+                    !matches!(n, XmlNode::Element(e)
+                        if e.local_name() == "Override"
+                            && e.attr_local("PartName") == Some(&part_name))
+                });
+                self.pkg.put_xml(CONTENT_TYPES_PART, &ct)?;
+                self.pkg.remove_part(&notes_part);
+                self.pkg.remove_part(&notes_rels);
+            }
             let slide = self.slides.remove(slide_idx);
             // Remove sldIdLst entry.
             if let Some(lst) = self.presentation.child_mut("sldIdLst") {
@@ -1637,6 +2075,142 @@ impl Handler for Pptx {
         })
     }
 
+    fn copy_el(&mut self, path_str: &str, pos: &Position) -> Result<Report> {
+        let dpath = path::parse(path_str)?;
+        if dpath.is_root() {
+            bail!("cannot copy the presentation root");
+        }
+        let slide_idx = self.slide_index(&dpath.segments[0])?;
+
+        // Duplicate a whole slide (content, rels, background, notes).
+        if dpath.segments.len() == 1 {
+            let src_xml = self.slides[slide_idx].xml.clone();
+            let mut src_rels = self.slides[slide_idx].rels.clone();
+            // A notes slide belongs to exactly one slide; the copy gets its
+            // own below.
+            src_rels.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e)
+                    if e.attr_local("Type") == Some(NOTES_SLIDE_REL_TYPE))
+            });
+            let notes = self.notes_text(&self.slides[slide_idx]);
+
+            let next_part_num = self
+                .pkg
+                .part_names()
+                .filter_map(|p| {
+                    p.strip_prefix("ppt/slides/slide")
+                        .and_then(|s| s.strip_suffix(".xml"))
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let part = format!("ppt/slides/slide{next_part_num}.xml");
+            let rid = crate::media::add_relationship(
+                &mut self.rels,
+                SLIDE_REL_TYPE,
+                &format!("slides/slide{next_part_num}.xml"),
+            );
+            self.pkg.add_override(&part, SLIDE_CONTENT_TYPE)?;
+
+            let sld_id_lst = self
+                .presentation
+                .ensure_child("sldIdLst", "p:sldIdLst", false);
+            let next_sld_id = sld_id_lst
+                .children_named("sldId")
+                .into_iter()
+                .filter_map(|e| e.attr_local("id").and_then(|v| v.parse::<u64>().ok()))
+                .max()
+                .unwrap_or(255)
+                + 1;
+            // Default: right after the original.
+            let insert_at = match pos {
+                Position::Append => sld_id_lst
+                    .nth_child_index("sldId", slide_idx)
+                    .map(|i| i + 1)
+                    .unwrap_or(sld_id_lst.children.len()),
+                Position::Index(n) => {
+                    let count = sld_id_lst.children_named("sldId").len();
+                    sld_id_lst
+                        .nth_child_index("sldId", (*n).min(count.saturating_sub(1)))
+                        .unwrap_or(sld_id_lst.children.len())
+                }
+                _ => bail!("copy slide supports the default position (after the original) or --index N"),
+            };
+            let entry = el(
+                "p:sldId",
+                &[
+                    ("id", next_sld_id.to_string().as_str()),
+                    ("r:id", rid.as_str()),
+                ],
+            );
+            sld_id_lst.children.insert(insert_at, XmlNode::Element(entry));
+            let slide_pos = {
+                let lst = self.presentation.child("sldIdLst").unwrap();
+                lst.children[..insert_at]
+                    .iter()
+                    .filter(|n| matches!(n, XmlNode::Element(e) if e.local_name() == "sldId"))
+                    .count()
+            };
+            self.slides.insert(
+                slide_pos,
+                Slide {
+                    part,
+                    rid,
+                    xml: src_xml,
+                    rels: src_rels,
+                },
+            );
+            if let Some(notes) = notes {
+                self.set_notes(slide_pos, &notes)?;
+            }
+            let mut info = self.slide_info(slide_pos, 1)?;
+            info.attr("copied-from", path_str);
+            return Ok(Report::Nodes(vec![info]));
+        }
+
+        // Duplicate a shape within its slide.
+        let shape_child_idx = self.find_shape(slide_idx, &dpath.segments[1])?;
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let mut clone = tree.children[shape_child_idx]
+            .as_element()
+            .context("shape vanished")?
+            .clone();
+        let new_id = Self::next_shape_id(tree);
+        if let Some(cnvpr) = clone
+            .children
+            .iter_mut()
+            .filter_map(|n| n.as_element_mut())
+            .find(|e| e.local_name().starts_with("nv") && e.local_name().ends_with("Pr"))
+            .and_then(|nv| nv.child_mut("cNvPr"))
+        {
+            cnvpr.set_attr("id", &new_id.to_string());
+            let name = cnvpr.attr_local("name").unwrap_or("Shape").to_string();
+            cnvpr.set_attr("name", &format!("{name} Copy"));
+        }
+        let insert_at = match pos {
+            Position::Append => shape_child_idx + 1,
+            Position::Index(n) => {
+                let tree = Self::sp_tree(&self.slides[slide_idx])?;
+                let idxs = Self::shape_indices(tree);
+                idxs.get(*n).copied().unwrap_or(tree.children.len())
+            }
+            _ => bail!("copy shape supports the default position (after the original) or --index N"),
+        };
+        let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
+        tree.children.insert(insert_at, XmlNode::Element(clone));
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let e = tree.children[insert_at].as_element().unwrap();
+        let position = Self::shape_indices(tree)
+            .iter()
+            .position(|&i| i == insert_at)
+            .unwrap_or(0);
+        let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, position + 1);
+        let mut info = self.shape_info(e, &spath);
+        info.attr("copied-from", path_str);
+        Ok(Report::Nodes(vec![info]))
+    }
+
     fn swap(&mut self, path1: &str, path2: &str) -> Result<Report> {
         let d1 = path::parse(path1)?;
         let d2 = path::parse(path2)?;
@@ -1701,15 +2275,9 @@ impl Handler for Pptx {
 
         let mut images = Vec::new();
         for slide in &self.slides {
-            let bg = slide
-                .xml
-                .child("cSld")
-                .and_then(|c| c.child("bg"))
-                .and_then(|bg| bg.child("bgPr"))
-                .and_then(|p| p.child("solidFill"))
-                .and_then(|f| f.child("srgbClr"))
-                .and_then(|c| c.attr_local("val"))
-                .and_then(Color::from_hex)
+            let bg = self
+                .slide_bg_color(slide)
+                .and_then(|hex| Color::from_hex(&hex))
                 .unwrap_or(WHITE);
             // Dark backgrounds get light default text.
             let default_text = if (bg.r as u32 + bg.g as u32 + bg.b as u32) < 3 * 110 {
@@ -1734,10 +2302,8 @@ impl Handler for Pptx {
                 let h = emu(xfrm.and_then(|x| x.child("ext")), "cy");
                 if let Some(fill) = e
                     .child("spPr")
-                    .and_then(|sp| sp.child("solidFill"))
-                    .and_then(|f| f.child("srgbClr"))
-                    .and_then(|c| c.attr_local("val"))
-                    .and_then(Color::from_hex)
+                    .and_then(|sp| resolve_fill_color(sp, &self.theme))
+                    .and_then(|hex| Color::from_hex(&hex))
                 {
                     canvas.fill_rect(x, y, w, h, fill);
                 }
@@ -1761,11 +2327,19 @@ impl Handler for Pptx {
                         let Some(tx) = e.child("txBody") else { continue };
                         let mut top = y;
                         let pad = 4.0;
+                        let mut bullet_counters: std::collections::HashMap<u32, u32> =
+                            Default::default();
                         for p in tx.children_named("p") {
                             let algn = p
                                 .child("pPr")
                                 .and_then(|pr| pr.attr_local("algn"))
                                 .unwrap_or("l");
+                            let list_level: u32 = p
+                                .child("pPr")
+                                .and_then(|pr| pr.attr_local("lvl"))
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            let marker = slide_list_marker(p, &mut bullet_counters);
                             let mut spans: Vec<Span> = Vec::new();
                             for r in p.children_named("r") {
                                 let rpr = r.child("rPr");
@@ -1775,10 +2349,8 @@ impl Handler for Pptx {
                                     .map(|v| v / 100.0)
                                     .unwrap_or(18.0);
                                 let color = rpr
-                                    .and_then(|rp| rp.child("solidFill"))
-                                    .and_then(|f| f.child("srgbClr"))
-                                    .and_then(|c| c.attr_local("val"))
-                                    .and_then(Color::from_hex)
+                                    .and_then(|rp| resolve_fill_color(rp, &self.theme))
+                                    .and_then(|hex| Color::from_hex(&hex))
                                     .unwrap_or(default_text);
                                 let bold =
                                     rpr.map(|rp| rp.attr_local("b") == Some("1")).unwrap_or(false);
@@ -1795,16 +2367,23 @@ impl Handler for Pptx {
                                 top += 18.0 * px_per_pt * 1.25;
                                 continue;
                             }
+                            let mut extra_indent = 0.0f32;
+                            if let Some(marker) = marker {
+                                let size = spans.first().map(|s| s.size).unwrap_or(18.0);
+                                let color = spans.first().map(|s| s.color).unwrap_or(default_text);
+                                extra_indent = size * 1.2 * list_level as f32;
+                                spans.insert(0, Span { text: marker, size, color, bold: false });
+                            }
                             let max_size = spans.iter().map(|s| s.size).fold(12.0f32, f32::max);
                             let line_h = max_size * 1.25;
-                            let usable = (w - 2.0 * pad).max(20.0);
+                            let usable = (w - 2.0 * pad - extra_indent).max(20.0);
                             for line in canvas.layout_spans(&spans, usable) {
                                 let lw = canvas.spans_width(&line);
                                 let lx = match algn {
                                     "ctr" => x + pad + (usable - lw) / 2.0,
                                     "r" => x + pad + usable - lw,
                                     _ => x + pad,
-                                };
+                                } + extra_indent;
                                 let asc = canvas.ascent(max_size, false);
                                 canvas.draw_spans_line(&line, lx, top + pad + asc);
                                 top += line_h;
@@ -1822,16 +2401,11 @@ impl Handler for Pptx {
         let mut ops = Vec::new();
         for (i, slide) in self.slides.iter().enumerate() {
             let mut slide_props = serde_json::Map::new();
-            if let Some(bg_color) = slide
-                .xml
-                .child("cSld")
-                .and_then(|c| c.child("bg"))
-                .and_then(|bg| bg.child("bgPr"))
-                .and_then(|p| p.child("solidFill"))
-                .and_then(|f| f.child("srgbClr"))
-                .and_then(|c| c.attr_local("val"))
-            {
+            if let Some(bg_color) = self.slide_bg_color(slide) {
                 slide_props.insert("background".into(), json!(bg_color));
+            }
+            if let Some(notes) = self.notes_text(slide) {
+                slide_props.insert("notes".into(), json!(notes));
             }
             ops.push(json!({
                 "command": "add", "parent": "/", "type": "slide",
@@ -1886,9 +2460,7 @@ impl Handler for Pptx {
                 }
                 if let Some(fill) = e
                     .child("spPr")
-                    .and_then(|sp| sp.child("solidFill"))
-                    .and_then(|f| f.child("srgbClr"))
-                    .and_then(|c| c.attr_local("val"))
+                    .and_then(|sp| resolve_fill_color(sp, &self.theme))
                 {
                     props.insert("fill".into(), json!(fill));
                 }
@@ -1921,11 +2493,7 @@ impl Handler for Pptx {
                     if rpr.attr_local("b") == Some("1") {
                         props.insert("bold".into(), json!("true"));
                     }
-                    if let Some(color) = rpr
-                        .child("solidFill")
-                        .and_then(|f| f.child("srgbClr"))
-                        .and_then(|c| c.attr_local("val"))
-                    {
+                    if let Some(color) = resolve_fill_color(rpr, &self.theme) {
                         props.insert("color".into(), json!(color));
                     }
                     if let Some(font) = rpr.child("latin").and_then(|l| l.attr_local("typeface"))
@@ -2035,7 +2603,12 @@ impl Pptx {
     }
 }
 
-fn render_shape_html(e: &XmlElement, scale: f64, out: &mut String) {
+fn render_shape_html(
+    e: &XmlElement,
+    scale: f64,
+    theme: &std::collections::HashMap<String, String>,
+    out: &mut String,
+) {
     let xfrm = e.child("spPr").and_then(|sp| sp.child("xfrm"));
     let get = |el: Option<&XmlElement>, a: &str| -> f64 {
         el.and_then(|e| e.attr_local(a))
@@ -2050,12 +2623,7 @@ fn render_shape_html(e: &XmlElement, scale: f64, out: &mut String) {
         "left:{:.0}px;top:{:.0}px;width:{:.0}px;height:{:.0}px;",
         x, y, w, h
     );
-    if let Some(fill) = e
-        .child("spPr")
-        .and_then(|sp| sp.child("solidFill"))
-        .and_then(|f| f.child("srgbClr"))
-        .and_then(|c| c.attr_local("val"))
-    {
+    if let Some(fill) = e.child("spPr").and_then(|sp| resolve_fill_color(sp, theme)) {
         css.push_str(&format!("background:#{fill};"));
     }
     out.push_str(&format!("<div class=\"shape\" style=\"{css}\">"));
@@ -2085,11 +2653,7 @@ fn render_shape_html(e: &XmlElement, scale: f64, out: &mut String) {
                     if rpr.attr_local("i") == Some("1") {
                         span.push_str("font-style:italic;");
                     }
-                    if let Some(color) = rpr
-                        .child("solidFill")
-                        .and_then(|f| f.child("srgbClr"))
-                        .and_then(|c| c.attr_local("val"))
-                    {
+                    if let Some(color) = resolve_fill_color(rpr, theme) {
                         span.push_str(&format!("color:#{color};"));
                     }
                     if let Some(font) = rpr.child("latin").and_then(|l| l.attr_local("typeface")) {
@@ -2127,6 +2691,27 @@ where
         if let XmlNode::Element(ce) = child {
             for_each_a_paragraph(ce, f);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_color_mods;
+    use crate::xml::el;
+
+    #[test]
+    fn color_mods_approximate_office() {
+        // accent1 4472C4 at lumMod 75% (as PowerPoint's "darker 25%").
+        let mut clr = el("a:schemeClr", &[("val", "accent1")]);
+        clr.push(el("a:lumMod", &[("val", "75000")]));
+        assert_eq!(apply_color_mods("4472C4", &clr), "335593");
+        // lumMod 60% + lumOff 40% (a "lighter 40%" variant).
+        let mut clr = el("a:schemeClr", &[("val", "accent1")]);
+        clr.push(el("a:lumMod", &[("val", "60000")]));
+        clr.push(el("a:lumOff", &[("val", "40000")]));
+        assert_eq!(apply_color_mods("4472C4", &clr), "8EAADB");
+        // No mods pass through.
+        assert_eq!(apply_color_mods("FF0000", &el("a:srgbClr", &[])), "FF0000");
     }
 }
 

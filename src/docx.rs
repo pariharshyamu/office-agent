@@ -15,6 +15,10 @@ use crate::xml::{el, XmlElement, XmlNode};
 const DOCUMENT_PART: &str = "word/document.xml";
 const DOC_RELS_PART: &str = "word/_rels/document.xml.rels";
 const COMMENTS_PART: &str = "word/comments.xml";
+const NUMBERING_PART: &str = "word/numbering.xml";
+/// numId of the shared bullet / decimal list definitions we create.
+const BULLET_NUM_ID: u32 = 1;
+const DECIMAL_NUM_ID: u32 = 2;
 const FOOTNOTES_PART: &str = "word/footnotes.xml";
 const SETTINGS_PART: &str = "word/settings.xml";
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -24,6 +28,38 @@ pub struct Docx {
     pkg: Package,
     doc: XmlElement,
     rels: XmlElement,
+    /// word/numbering.xml, when the document has one (lists).
+    numbering: Option<XmlElement>,
+}
+
+/// Map a friendly list kind to our shared numId (None = remove numbering).
+fn list_num_id(kind: &str) -> Result<Option<u32>> {
+    match kind.to_ascii_lowercase().as_str() {
+        "bullet" | "bullets" | "ul" => Ok(Some(BULLET_NUM_ID)),
+        "number" | "numbered" | "decimal" | "ol" => Ok(Some(DECIMAL_NUM_ID)),
+        "none" => Ok(None),
+        other => bail!("unknown list kind '{other}' (bullet/number/none)"),
+    }
+}
+
+/// Build a `w:numPr` for a list level.
+fn build_numpr(num_id: u32, level: u32) -> XmlElement {
+    let mut numpr = XmlElement::new("w:numPr");
+    numpr.push(el("w:ilvl", &[("w:val", level.to_string().as_str())]));
+    numpr.push(el("w:numId", &[("w:val", num_id.to_string().as_str())]));
+    numpr
+}
+
+/// (numId, level) of a paragraph's numbering, if any.
+fn paragraph_numpr(p: &XmlElement) -> Option<(String, u32)> {
+    let numpr = p.child("pPr")?.child("numPr")?;
+    let num_id = numpr.child("numId")?.attr_local("val")?.to_string();
+    let level = numpr
+        .child("ilvl")
+        .and_then(|i| i.attr_local("val"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    Some((num_id, level))
 }
 
 /// Map friendly element names to OOXML local names.
@@ -57,7 +93,34 @@ impl Docx {
     pub fn new(pkg: Package) -> Result<Docx> {
         let doc = pkg.xml(DOCUMENT_PART)?;
         let rels = pkg.xml(DOC_RELS_PART)?;
-        Ok(Docx { pkg, doc, rels })
+        let numbering = if pkg.has_part(NUMBERING_PART) {
+            Some(pkg.xml(NUMBERING_PART)?)
+        } else {
+            None
+        };
+        Ok(Docx { pkg, doc, rels, numbering })
+    }
+
+    /// "bullet" or "number" for a numId, resolved through numbering.xml.
+    fn list_kind_for_num(&self, num_id: &str) -> Option<&'static str> {
+        let numbering = self.numbering.as_ref()?;
+        let abs_id = numbering
+            .children_named("num")
+            .into_iter()
+            .find(|n| n.attr_local("numId") == Some(num_id))?
+            .child("abstractNumId")?
+            .attr_local("val")?
+            .to_string();
+        let abs = numbering
+            .children_named("abstractNum")
+            .into_iter()
+            .find(|a| a.attr_local("abstractNumId") == Some(abs_id.as_str()))?;
+        let fmt = abs
+            .children_named("lvl")
+            .first()?
+            .child("numFmt")?
+            .attr_local("val")?;
+        Some(if fmt == "bullet" { "bullet" } else { "number" })
     }
 
     fn build_image_paragraph(&mut self, props: &Props) -> Result<XmlElement> {
@@ -214,9 +277,11 @@ impl Docx {
         let mut indices = Vec::new();
         let mut current = body;
         for seg in segments {
-            let idx = find_child(current, seg)?;
-            indices.push(idx);
-            current = current.children[idx].as_element().unwrap();
+            let chain = find_child(current, seg)?;
+            for &idx in &chain {
+                current = current.children[idx].as_element().unwrap();
+            }
+            indices.extend(chain);
         }
         Ok(indices)
     }
@@ -242,22 +307,27 @@ impl Docx {
     }
 
     /// Canonical display path (e.g. /body/p[3]) for a resolved index chain.
+    /// sdt wrappers are invisible: elements inside them are numbered among
+    /// their logical siblings.
     fn display_path(&self, indices: &[usize]) -> Result<String> {
         let mut out = String::from("/body");
-        let mut current = self.body()?;
-        for &i in indices {
-            let element = current.children[i].as_element().unwrap();
-            let local = element.local_name().to_string();
-            let mut nth = 0;
-            for node in &current.children[..i] {
-                if let XmlNode::Element(e) = node {
-                    if e.local_name() == local {
-                        nth += 1;
-                    }
-                }
-            }
+        let mut parent = self.body()?;
+        let mut rest: &[usize] = indices;
+        while !rest.is_empty() {
+            let entries = logical_children(parent);
+            let hit = entries
+                .iter()
+                .position(|(chain, _)| rest.len() >= chain.len() && rest[..chain.len()] == chain[..])
+                .context("internal: index chain does not match the document")?;
+            let (chain, element) = &entries[hit];
+            let local = element.local_name();
+            let nth = entries[..hit]
+                .iter()
+                .filter(|(_, e)| e.local_name() == local)
+                .count();
             out.push_str(&format!("/{}[{}]", local, nth + 1));
-            current = element;
+            rest = &rest[chain.len()..];
+            parent = element;
         }
         Ok(out)
     }
@@ -274,6 +344,13 @@ impl Docx {
                     }
                     if let Some(jc) = ppr.child("jc").and_then(|s| s.attr_local("val")) {
                         info.attr("align", jc);
+                    }
+                }
+                if let Some((num_id, level)) = paragraph_numpr(element) {
+                    let kind = self.list_kind_for_num(&num_id).unwrap_or("list");
+                    info.attr("list", kind);
+                    if level > 0 {
+                        info.attr("level", level.to_string());
                     }
                 }
             }
@@ -296,11 +373,27 @@ impl Docx {
             "tr" | "tc" => {
                 info.text = Some(element.text_content());
             }
+            "hyperlink" => {
+                info.text = Some(element.text_content());
+                if let Some(url) = element
+                    .attr("r:id")
+                    .or_else(|| element.attr_local("id"))
+                    .and_then(|rid| {
+                        self.rels
+                            .children_named("Relationship")
+                            .into_iter()
+                            .find(|r| r.attr_local("Id") == Some(rid))
+                            .and_then(|r| r.attr_local("Target"))
+                    })
+                {
+                    info.attr("url", url);
+                }
+            }
             _ => {}
         }
         if depth > 0 {
             let mut counts: std::collections::HashMap<String, usize> = Default::default();
-            for child in element.elements() {
+            for (_, child) in logical_children(element) {
                 let cl = child.local_name();
                 if matches!(cl, "pPr" | "rPr" | "tblPr" | "tblGrid" | "trPr" | "tcPr" | "sectPr") {
                     continue;
@@ -322,6 +415,18 @@ impl Docx {
         let mut ppr = XmlElement::new("w:pPr");
         if let Some(style) = props.get("style") {
             ppr.push(el("w:pStyle", &[("w:val", style)]));
+        }
+        if let Some(kind) = props.get("list") {
+            if let Some(num_id) = list_num_id(kind)? {
+                let level: u32 = props
+                    .get("level")
+                    .map(|v| v.parse())
+                    .transpose()
+                    .context("level must be a number (0-8)")?
+                    .unwrap_or(0)
+                    .min(8);
+                ppr.push(build_numpr(num_id, level));
+            }
         }
         if let Some(align) = props.get("align") {
             let (jc, _) = parse_align(align)?;
@@ -425,8 +530,10 @@ impl Docx {
                     at
                 }
                 Position::Before(p) | Position::After(p) => {
+                    // Anchors inside sdt wrappers resolve to longer chains;
+                    // insertion happens beside the outermost wrapper.
                     let anchor = self.resolve(&path::parse(p)?)?;
-                    if anchor.len() != parent_indices.len() + 1
+                    if anchor.len() < parent_indices.len() + 1
                         || anchor[..parent_indices.len()] != *parent_indices
                     {
                         bail!("anchor '{p}' is not a direct child of the target parent");
@@ -726,6 +833,157 @@ impl Docx {
         Ok(Report::Nodes(vec![info]))
     }
 
+    /// Make sure word/numbering.xml exists with the shared bullet (numId 1)
+    /// and decimal (numId 2) definitions.
+    fn ensure_numbering(&mut self) -> Result<()> {
+        if self.pkg.has_part(NUMBERING_PART) {
+            return Ok(());
+        }
+        let mut numbering = el("w:numbering", &[("xmlns:w", W_NS)]);
+        for (abstract_id, bullet) in [(0u32, true), (1u32, false)] {
+            let mut abs = el(
+                "w:abstractNum",
+                &[("w:abstractNumId", abstract_id.to_string().as_str())],
+            );
+            abs.push(el("w:multiLevelType", &[("w:val", "hybridMultilevel")]));
+            for ilvl in 0..9u32 {
+                let mut lvl = el("w:lvl", &[("w:ilvl", ilvl.to_string().as_str())]);
+                lvl.push(el("w:start", &[("w:val", "1")]));
+                if bullet {
+                    lvl.push(el("w:numFmt", &[("w:val", "bullet")]));
+                    lvl.push(el("w:lvlText", &[("w:val", "•")]));
+                } else {
+                    lvl.push(el("w:numFmt", &[("w:val", "decimal")]));
+                    lvl.push(el(
+                        "w:lvlText",
+                        &[("w:val", format!("%{}.", ilvl + 1).as_str())],
+                    ));
+                }
+                lvl.push(el("w:lvlJc", &[("w:val", "left")]));
+                let mut ppr = XmlElement::new("w:pPr");
+                let left = 720 * (ilvl + 1);
+                ppr.push(el(
+                    "w:ind",
+                    &[("w:left", left.to_string().as_str()), ("w:hanging", "360")],
+                ));
+                lvl.push(ppr);
+                abs.push(lvl);
+            }
+            numbering.push(abs);
+        }
+        for (num_id, abstract_id) in [(BULLET_NUM_ID, 0u32), (DECIMAL_NUM_ID, 1u32)] {
+            let mut num = el("w:num", &[("w:numId", num_id.to_string().as_str())]);
+            num.push(el(
+                "w:abstractNumId",
+                &[("w:val", abstract_id.to_string().as_str())],
+            ));
+            numbering.push(num);
+        }
+        self.pkg.add_override(
+            NUMBERING_PART,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+        )?;
+        let rel_type = format!("{REL_NS}/numbering");
+        let has_rel = self
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .any(|r| r.attr_local("Type") == Some(rel_type.as_str()));
+        if !has_rel {
+            crate::media::add_relationship(&mut self.rels, &rel_type, "numbering.xml");
+        }
+        self.pkg.put_xml(NUMBERING_PART, &numbering)
+    }
+
+    /// "• " / "3. " prefix (with level indent) for a list paragraph.
+    fn list_marker(
+        &self,
+        p: &XmlElement,
+        counters: &mut std::collections::HashMap<(String, u32), u32>,
+    ) -> Option<String> {
+        let (num_id, level) = paragraph_numpr(p)?;
+        let indent = "  ".repeat(level as usize);
+        let marker = match self.list_kind_for_num(&num_id) {
+            Some("number") => {
+                let c = counters.entry((num_id, level)).or_insert(0);
+                *c += 1;
+                format!("{c}.")
+            }
+            _ => "•".to_string(),
+        };
+        Some(format!("{indent}{marker} "))
+    }
+
+    /// Add a whole list: one paragraph per `\n`-separated item, leading
+    /// tabs selecting deeper levels.
+    fn add_list(&mut self, parent: &[usize], props: &Props, pos: &Position) -> Result<Report> {
+        let parent_local = self.node_at(parent)?.local_name().to_string();
+        if !matches!(parent_local.as_str(), "body" | "tc") {
+            bail!("lists are added to /body or a table cell");
+        }
+        let items_raw = props
+            .get("items")
+            .context(r#"list needs --prop items="First\nSecond\n\tNested" (\n separates items, leading \t = deeper level)"#)?
+            .replace("\\n", "\n")
+            .replace("\\t", "\t");
+        let kind = props.get("kind").unwrap_or("bullet").to_string();
+        if list_num_id(&kind)?.is_none() {
+            bail!("list kind cannot be 'none'");
+        }
+        self.ensure_numbering()?;
+        let items: Vec<(usize, String)> = items_raw
+            .split('\n')
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let level = l.chars().take_while(|c| *c == '\t').count().min(8);
+                (level, l.trim_start_matches('\t').trim_end().to_string())
+            })
+            .collect();
+        if items.is_empty() {
+            bail!("list has no items");
+        }
+        // Per-item props: text/list/level plus pass-through formatting.
+        let passthrough: Vec<(String, String)> = props
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "items" | "kind" | "list" | "level" | "text"
+                )
+            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let build = |me: &Self, level: usize, text: &str| -> Result<XmlElement> {
+            let mut pairs = vec![
+                ("text".to_string(), text.to_string()),
+                ("list".to_string(), kind.clone()),
+                ("level".to_string(), level.to_string()),
+            ];
+            pairs.extend(passthrough.iter().cloned());
+            me.build_paragraph(&Props::from_pairs(pairs))
+        };
+        match pos {
+            Position::Append => {
+                for (level, text) in &items {
+                    let p = build(self, *level, text)?;
+                    self.insert_into(parent, p, pos)?;
+                }
+            }
+            // Inserting at a fixed anchor: go in reverse so the final
+            // document order matches the input order.
+            _ => {
+                for (level, text) in items.iter().rev() {
+                    let p = build(self, *level, text)?;
+                    self.insert_into(parent, p, pos)?;
+                }
+            }
+        }
+        Ok(Report::Data {
+            text: format!("added {} {kind} list item(s)", items.len()),
+            data: json!({ "items": items.len(), "kind": kind }),
+        })
+    }
+
     /// Make sure word/settings.xml exists and asks Word to update fields on
     /// open (used by TOC so it populates itself).
     fn ensure_update_fields(&mut self) -> Result<()> {
@@ -803,13 +1061,44 @@ impl Docx {
         if let Some(text) = props.get("text") {
             set_paragraph_text(p, text);
         }
-        if props.has("style") || props.has("align") {
+        if props.has("style") || props.has("align") || props.has("list") {
             let style = props.get("style").map(|s| s.to_string());
             let align = props.get("align").map(|s| s.to_string());
+            let list = props
+                .get("list")
+                .map(|kind| {
+                    let level: u32 = props
+                        .get("level")
+                        .map(|v| v.parse())
+                        .transpose()
+                        .context("level must be a number (0-8)")?
+                        .unwrap_or(0)
+                        .min(8);
+                    Ok::<_, anyhow::Error>((list_num_id(kind)?, level))
+                })
+                .transpose()?;
+            let p = self.node_at_mut(indices)?;
             let ppr = p.ensure_child("pPr", "w:pPr", true);
             if let Some(style) = style {
                 let e = ppr.ensure_child("pStyle", "w:pStyle", true);
                 e.set_attr("w:val", &style);
+            }
+            if let Some((num_id, level)) = list {
+                ppr.children.retain(|n| {
+                    !matches!(n, XmlNode::Element(e) if e.local_name() == "numPr")
+                });
+                if let Some(num_id) = num_id {
+                    // numPr follows pStyle in the pPr schema order.
+                    let at = ppr
+                        .children
+                        .iter()
+                        .position(|n| {
+                            !matches!(n, XmlNode::Element(e) if e.local_name() == "pStyle")
+                        })
+                        .unwrap_or(ppr.children.len());
+                    ppr.children
+                        .insert(at, XmlNode::Element(build_numpr(num_id, level)));
+                }
             }
             if let Some(align) = align {
                 let (jc, _) = parse_align(&align)?;
@@ -834,32 +1123,66 @@ impl Docx {
     }
 }
 
-fn find_child(parent: &XmlElement, seg: &Segment) -> Result<usize> {
+/// Logical children of `parent`, looking straight through `w:sdt` content
+/// controls (Word wraps arbitrary blocks in them). Each entry is the raw
+/// `children`-index chain from `parent` to the element.
+fn logical_children(parent: &XmlElement) -> Vec<(Vec<usize>, &XmlElement)> {
+    fn walk<'a>(
+        e: &'a XmlElement,
+        prefix: &mut Vec<usize>,
+        out: &mut Vec<(Vec<usize>, &'a XmlElement)>,
+    ) {
+        for (i, node) in e.children.iter().enumerate() {
+            let XmlNode::Element(c) = node else { continue };
+            if c.local_name() == "sdt" {
+                if let Some(ci) = c.children.iter().position(|n| {
+                    matches!(n, XmlNode::Element(g) if g.local_name() == "sdtContent")
+                }) {
+                    prefix.push(i);
+                    prefix.push(ci);
+                    walk(c.children[ci].as_element().unwrap(), prefix, out);
+                    prefix.pop();
+                    prefix.pop();
+                }
+                continue;
+            }
+            let mut chain = prefix.clone();
+            chain.push(i);
+            out.push((chain, c));
+        }
+    }
+    let mut out = Vec::new();
+    walk(parent, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Resolve one path segment to the raw index chain of the matching logical
+/// child (which may sit inside sdt wrappers).
+fn find_child(parent: &XmlElement, seg: &Segment) -> Result<Vec<usize>> {
     let local = ooxml_name(&seg.name)
         .map(|s| s.to_string())
         .unwrap_or_else(|| seg.name.clone());
-    let mut matches: Vec<usize> = Vec::new();
-    for (i, node) in parent.children.iter().enumerate() {
-        if let XmlNode::Element(e) = node {
-            if e.local_name() == local {
-                let attr_ok = seg.preds.iter().all(|p| match p {
-                    Predicate::Attr(k, v) => e.attr_local(k).map(|av| av == v).unwrap_or(false),
-                    Predicate::Index(_) => true,
-                });
-                if attr_ok {
-                    matches.push(i);
-                }
+    let mut matches: Vec<Vec<usize>> = Vec::new();
+    for (chain, e) in logical_children(parent) {
+        if e.local_name() == local {
+            let attr_ok = seg.preds.iter().all(|p| match p {
+                Predicate::Attr(k, v) => e.attr_local(k).map(|av| av == v).unwrap_or(false),
+                Predicate::Index(_) => true,
+            });
+            if attr_ok {
+                matches.push(chain);
             }
         }
     }
     let nth = seg.index().unwrap_or(1);
-    matches.get(nth - 1).copied().with_context(|| {
+    let count = matches.len();
+    matches.into_iter().nth(nth - 1).with_context(|| {
         format!(
             "no element matches '{}[{}]' under <{}> ({} candidate(s))",
             seg.name,
             nth,
             parent.local_name(),
-            matches.len()
+            count
         )
     })
 }
@@ -1378,9 +1701,13 @@ impl Handler for Docx {
         match mode {
             "text" => {
                 let mut out = String::new();
-                for element in body.elements() {
+                let mut counters: std::collections::HashMap<(String, u32), u32> = Default::default();
+                for (_, element) in logical_children(&body) {
                     match element.local_name() {
                         "p" => {
+                            if let Some(marker) = self.list_marker(element, &mut counters) {
+                                out.push_str(&marker);
+                            }
                             out.push_str(&paragraph_text(element));
                             out.push('\n');
                         }
@@ -1409,7 +1736,7 @@ impl Handler for Docx {
                         *plain = 0;
                     }
                 };
-                for element in body.elements() {
+                for (_, element) in logical_children(&body) {
                     match element.local_name() {
                         "p" => {
                             let style = element
@@ -1452,7 +1779,7 @@ impl Handler for Docx {
                 let mut paragraphs = 0usize;
                 let mut tables = 0usize;
                 let mut text = String::new();
-                for element in body.elements() {
+                for (_, element) in logical_children(&body) {
                     match element.local_name() {
                         "p" => {
                             paragraphs += 1;
@@ -1482,7 +1809,7 @@ impl Handler for Docx {
             }
             "html" => {
                 let mut out = String::new();
-                for element in body.elements() {
+                for (_, element) in logical_children(&body) {
                     render_html_block(element, &mut out);
                 }
                 Ok(Report::Text(crate::html::page("Document", &out)))
@@ -1530,7 +1857,11 @@ impl Handler for Docx {
             "comment" => return self.add_comment(&parent_indices, props),
             "footnote" => return self.add_footnote(&parent_indices, props),
             "field" => return self.add_field(&parent_indices, props),
+            "list" => return self.add_list(&parent_indices, props, pos),
             _ => {}
+        }
+        if props.has("list") {
+            self.ensure_numbering()?;
         }
 
         let element = match typ.to_ascii_lowercase().as_str() {
@@ -1594,6 +1925,33 @@ impl Handler for Docx {
                 self.ensure_update_fields()?;
                 self.build_toc_paragraph(props)
             }
+            "hyperlink" | "link" => {
+                if parent_local != "p" {
+                    bail!("hyperlinks are added to a paragraph, e.g. add doc.docx '/body/p[1]' --type hyperlink --prop url=https://...");
+                }
+                let url = props
+                    .get("url")
+                    .or_else(|| props.get("href"))
+                    .context("hyperlink needs --prop url=https://...")?
+                    .to_string();
+                let rid = crate::media::add_external_relationship(
+                    &mut self.rels,
+                    crate::media::HYPERLINK_REL_TYPE,
+                    &url,
+                );
+                let text = props.get("text").unwrap_or(&url).to_string();
+                let mut link = el("w:hyperlink", &[("r:id", rid.as_str()), ("w:history", "1")]);
+                let mut run = build_run(&text, props)?;
+                let rpr = run.ensure_child("rPr", "w:rPr", true);
+                if rpr.child("color").is_none() {
+                    rpr.push(el("w:color", &[("w:val", "0563C1")]));
+                }
+                if rpr.child("u").is_none() {
+                    rpr.push(el("w:u", &[("w:val", "single")]));
+                }
+                link.push(run);
+                link
+            }
             other => bail!(
                 "unsupported docx element type '{other}' (paragraph/run/table/row/break/image/toc/field/comment/footnote)"
             ),
@@ -1653,7 +2011,12 @@ impl Handler for Docx {
         let indices = self.resolve(&dpath)?;
         let local = self.node_at(&indices)?.local_name().to_string();
         match local.as_str() {
-            "p" => self.apply_paragraph_props(&indices, props)?,
+            "p" => {
+                if props.has("list") {
+                    self.ensure_numbering()?;
+                }
+                self.apply_paragraph_props(&indices, props)?
+            }
             "r" => {
                 let run = self.node_at_mut(&indices)?;
                 apply_run_props(run, props)?;
@@ -1770,6 +2133,36 @@ impl Handler for Docx {
         Ok(Report::Nodes(vec![info]))
     }
 
+    fn copy_el(&mut self, path_str: &str, pos: &Position) -> Result<Report> {
+        let indices = self.resolve(&path::parse(path_str)?)?;
+        if indices.is_empty() {
+            bail!("cannot copy the document body");
+        }
+        let element = self.node_at(&indices)?.clone();
+        if element.local_name() == "sectPr" {
+            bail!("section properties cannot be copied");
+        }
+        let (parent_indices, last) = indices.split_at(indices.len() - 1);
+        // Default lands the copy right after the original.
+        let pos = match pos {
+            Position::Append => {
+                let parent = self.node_at(parent_indices)?;
+                let ordinal = parent.children[..last[0]]
+                    .iter()
+                    .filter(|n| matches!(n, XmlNode::Element(_)))
+                    .count();
+                Position::Index(ordinal + 1)
+            }
+            p => p.clone(),
+        };
+        let new_indices = self.insert_into(parent_indices, element, &pos)?;
+        let display = self.display_path(&new_indices)?;
+        let node = self.node_at(&new_indices)?;
+        let mut info = self.node_info(node, &display, 0);
+        info.attr("copied-from", path_str);
+        Ok(Report::Nodes(vec![info]))
+    }
+
     fn swap(&mut self, path1: &str, path2: &str) -> Result<Report> {
         let i1 = self.resolve(&path::parse(path1)?)?;
         let i2 = self.resolve(&path::parse(path2)?)?;
@@ -1799,6 +2192,7 @@ impl Handler for Docx {
         let body = self.body()?.clone();
         let mut pages: Vec<Canvas> = vec![Canvas::new(page_w as u32, page_h as u32, WHITE)?];
         let mut y = margin;
+        let mut list_counters: std::collections::HashMap<(String, u32), u32> = Default::default();
         macro_rules! new_page {
             () => {{
                 pages.push(Canvas::new(page_w as u32, page_h as u32, WHITE)?);
@@ -1813,7 +2207,7 @@ impl Handler for Docx {
             };
         }
 
-        for element in body.elements() {
+        for (_, element) in logical_children(&body) {
             match element.local_name() {
                 "p" => {
                     // Embedded image?
@@ -1892,6 +2286,21 @@ impl Handler for Docx {
                             });
                         }
                     }
+                    // List paragraphs get a marker span and an indent.
+                    let mut left_indent = 0.0f32;
+                    if let Some(marker) = self.list_marker(element, &mut list_counters) {
+                        let level = paragraph_numpr(element).map(|(_, l)| l).unwrap_or(0);
+                        left_indent = 24.0 * (level + 1) as f32;
+                        spans.insert(
+                            0,
+                            Span {
+                                text: marker.trim_start().to_string(),
+                                size: base_pt * px_per_pt,
+                                color: BLACK,
+                                bold: false,
+                            },
+                        );
+                    }
                     let align = element
                         .child("pPr")
                         .and_then(|ppr| ppr.child("jc"))
@@ -1905,16 +2314,17 @@ impl Handler for Docx {
                         y += line_h * 0.6;
                     } else {
                         let canvas_probe = pages.last().unwrap();
-                        let lines = canvas_probe.layout_spans(&spans, content_w);
+                        let usable = content_w - left_indent;
+                        let lines = canvas_probe.layout_spans(&spans, usable);
                         for line in lines {
                             need!(line_h);
                             let canvas = pages.last_mut().unwrap();
                             let lw = canvas.spans_width(&line);
                             let lx = match align {
-                                Some("center") => margin + (content_w - lw) / 2.0,
-                                Some("right") => margin + content_w - lw,
+                                Some("center") => margin + (usable - lw) / 2.0,
+                                Some("right") => margin + usable - lw,
                                 _ => margin,
-                            };
+                            } + left_indent;
                             let asc = canvas.ascent(max_size, base_bold);
                             canvas.draw_spans_line(&line, lx, y + asc);
                             y += line_h;
@@ -1959,7 +2369,7 @@ impl Handler for Docx {
         let mut ops = Vec::new();
         let mut tbl_count = 0usize;
         let mut p_count = 0usize;
-        for element in body.elements() {
+        for (_, element) in logical_children(&body) {
             match element.local_name() {
                 "p" => {
                     p_count += 1;
@@ -1988,6 +2398,13 @@ impl Handler for Docx {
                         }
                         if let Some(jc) = ppr.child("jc").and_then(|s| s.attr_local("val")) {
                             props.insert("align".into(), json!(jc));
+                        }
+                    }
+                    if let Some((num_id, level)) = paragraph_numpr(element) {
+                        let kind = self.list_kind_for_num(&num_id).unwrap_or("bullet");
+                        props.insert("list".into(), json!(kind));
+                        if level > 0 {
+                            props.insert("level".into(), json!(level.to_string()));
                         }
                     }
                     let runs: Vec<&XmlElement> =

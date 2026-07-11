@@ -173,8 +173,28 @@ pub fn add_relationship(rels: &mut crate::xml::XmlElement, rel_type: &str, targe
     rid
 }
 
+/// Add an external-target relationship (hyperlinks), returning the new rId.
+pub fn add_external_relationship(
+    rels: &mut crate::xml::XmlElement,
+    rel_type: &str,
+    target: &str,
+) -> String {
+    let rid = add_relationship(rels, rel_type, target);
+    if let Some(rel) = rels
+        .children
+        .iter_mut()
+        .filter_map(|n| n.as_element_mut())
+        .find(|e| e.local_name() == "Relationship" && e.attr_local("Id") == Some(rid.as_str()))
+    {
+        rel.set_attr("TargetMode", "External");
+    }
+    rid
+}
+
 pub const IMAGE_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+pub const HYPERLINK_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 
 #[cfg(test)]
 mod tests {

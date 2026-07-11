@@ -1,6 +1,6 @@
 [package]
 name = "officecli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A Rust port of OfficeCLI: a command-line Office suite for AI agents to read, edit, and automate Word, Excel, and PowerPoint files."
 license = "Apache-2.0"

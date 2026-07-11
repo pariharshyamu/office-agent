@@ -58,4 +58,17 @@ pub trait Handler {
     fn screenshot(&mut self) -> Result<Vec<Vec<u8>>> {
         anyhow::bail!("screenshot is not supported for this format")
     }
+
+    /// Export a cell range as CSV (xlsx only).
+    fn export_csv(&mut self, sheet: Option<&str>, range: Option<&str>) -> Result<String> {
+        let _ = (sheet, range);
+        anyhow::bail!("csv export is only supported for xlsx")
+    }
+
+    /// Duplicate an element (slide/sheet/row/paragraph/...). Returns info
+    /// about the copy.
+    fn copy_el(&mut self, path: &str, pos: &Position) -> Result<Report> {
+        let _ = (path, pos);
+        anyhow::bail!("copy is not supported for this format")
+    }
 }

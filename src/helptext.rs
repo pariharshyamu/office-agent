@@ -23,7 +23,10 @@ COMMANDS
       [--find TEXT [--replace TEXT]]            Find/format or find/replace
   move <file> <path> [--to P] [--index N|--before P|--after P]
   swap <file> <path1> <path2>                   Exchange two elements
+  copy <file> <path> [--index N]                Duplicate an element (slide,
+                                                sheet, row, paragraph, shape)
   remove <file> <path>                          Remove an element
+  export <file> [--range 'Sheet1!A1:C9'] [-o F] Cell range as CSV (xlsx)
   dump <file>                                   Replayable batch JSON
   batch <file> [--commands JSON|--input F|stdin] Many ops, one save
   validate <file>                               Check package structure
@@ -44,6 +47,7 @@ VALUE FORMATS
   Lengths     2cm, 1in, 72pt, 96px, or raw EMU (914400 = 1 inch)
   Font sizes  24 or 24pt
   Durations   500ms, 1.5s, or milliseconds
+  Dates       2026-07-10, 2026-07-10 14:30, 14:30:00 (xlsx: real date cells)
   Booleans    true/false
 
 QUICK START
@@ -90,12 +94,20 @@ ADD
   --type break       page break
   --type image       props: src=file.png (PNG/JPEG/GIF) or srcdata=BASE64,
                      w/h (optional, aspect kept), align
+  --type list        props: items="One\nTwo\n\tNested" (\n separates,
+                     leading \t = deeper level), kind=bullet|number,
+                     plus any paragraph format props
+  --type hyperlink   props: url, text; appended to a paragraph
   --type toc         table of contents field (parent /body); props: levels
                      ("1-3"); Word populates it on open/update
   --type field       props: kind=page|numpages|date|time|filename|author
                      or code="..." (parent = a paragraph)
   --type comment     props: text, author; attaches to a paragraph
   --type footnote    props: text; adds superscript reference + note
+
+  Paragraphs also take list=bullet|number|none and level=0-8 directly.
+  Word content controls (w:sdt) are transparent: wrapped paragraphs
+  address and edit as normal /body/p[N] paths.
 
 SET
   paragraph          text (replaces runs), style, align, plus run format
@@ -126,9 +138,12 @@ PATHS
 SET (cells are created on demand)
   value=Hello         inline string
   value=42            number (auto-detected)
+  value=2026-07-10    real date cell (auto-detected; type=string opts out)
   value="=SUM(A1:A9)" formula (auto-detected by leading '=')
-  type=string|number|boolean|formula   forces interpretation
-  bold, italic, color, size, font, fill   cell styling
+  type=string|number|boolean|date|formula   forces interpretation
+  format=date|datetime|time|percent|currency|integer|0.00|custom-code
+  url=https://...     hyperlink (styled blue + underline)
+  bold, italic, underline, color, size, font, fill   cell styling
   Formulas are stored uncalculated; Excel/LibreOffice recalculate on open.
 
 SET (sheet)
@@ -149,6 +164,13 @@ ADD
                  agg=sum|count|avg|min|max, name; writes a computed group-by
                  summary to a new sheet (static table, not an interactive
                  PivotTable)
+  --type csv     props: src=file.csv (or data=...), at=A1; values are
+                 auto-typed (numbers, dates, strings)
+
+COPY / EXPORT
+  officecli copy data.xlsx /Sheet1            duplicate a sheet
+  officecli copy data.xlsx '/Sheet1/row[2]'   duplicate a row (shifts down)
+  officecli export data.xlsx --range 'Sheet1!A1:C9' -o out.csv
 
 REMOVE
   /Sheet1        removes the sheet (refused for the last one)
@@ -172,11 +194,12 @@ PATHS
   /slide[1]/shape[@id=5]          by stable id (preferred in workflows)
 
 ADD
-  --type slide   props: title, background (color)      (added at '/')
+  --type slide   props: title, background (color), notes    (added at '/')
                  --index/--before/--after control position
   --type shape   textbox; props: text, x, y, w, h (lengths), size (pt),
-                 color, bold, italic, font, align, fill, name
-                 '\n' in text starts a new paragraph
+                 color, bold, italic, font, align, fill, name,
+                 url (hyperlink), list=bullet|number
+                 '\n' in text starts a new paragraph; leading '\t' = level
   --type image   props: src=file.png or srcdata=BASE64, x, y, w, h
   --type chart   props: kind=column|bar|line|pie, categories="Q1,Q2",
                  values="10,20", series=Name, values2=/series2= for more
@@ -184,22 +207,28 @@ ADD
                  (PowerPoint renders it; Edit Data needs a linked workbook)
 
 SET
-  slide          background=COLOR
+  slide          background=COLOR   notes="speaker notes"
                  transition=fade|cut|push|wipe|dissolve|circle|diamond|
                  plus|wedge|wheel|zoom|cover|pull|split|blinds|checker|
                  comb|strips|newsflash|random|none
                  [direction=left|right|up|down|horizontal|vertical|in|out]
                  [speed=slow|medium|fast or a duration] [advance=5s]
-  shape          text (replaces content), x/y/w/h, fill, name, and
+  shape          text (replaces content), x/y/w/h, fill, name, url, and
                  size/color/bold/italic/font/align applied to all runs
                  animation=appear|fade|wipe (click-triggered entrance;
                  [duration=500ms] [delay=0ms])
+
+COPY  officecli copy deck.pptx '/slide[1]'   duplicate (content + notes)
+      officecli copy deck.pptx '/slide[1]/shape[2]'
+
+Theme colors (schemeClr accent1..6, bg/tx aliases, lumMod/lumOff) are
+resolved through theme1.xml in views, screenshots, and dump.
 
 FIND / REPLACE
   officecli set deck.pptx / --find draft --replace final
   (find+format is not supported for pptx)
 
-VIEW  outline (slides + shapes), text, stats, html,
+VIEW  outline (slides + shapes), text, stats, html, notes,
       screenshot (-o deck.png; one PNG per slide)
 
 TIP  shape[1] is usually the title textbox on slides created with

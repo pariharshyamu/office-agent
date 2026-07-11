@@ -107,8 +107,50 @@ impl Xlsx {
             ),
             "b" => ((v.trim() == "1").to_string(), "boolean"),
             "e" => (v, "error"),
-            _ => (v, "number"),
+            _ => {
+                // Numbers styled with a date format read back as ISO.
+                if let Some(kind) = self.cell_date_kind(c) {
+                    if let Ok(serial) = v.trim().parse::<f64>() {
+                        let (wd, wt, label) = match kind {
+                            DateKind::Date => (true, false, "date"),
+                            DateKind::DateTime => (true, true, "datetime"),
+                            DateKind::Time => (false, true, "time"),
+                        };
+                        return (serial_to_iso(serial, wd, wt), label);
+                    }
+                }
+                (v, "number")
+            }
         }
+    }
+
+    /// Date-like number format applied to this cell, if any.
+    fn cell_date_kind(&self, c: &XmlElement) -> Option<DateKind> {
+        let s: usize = c.attr_local("s")?.parse().ok()?;
+        let xf = self
+            .styles
+            .child("cellXfs")?
+            .children_named("xf")
+            .get(s)
+            .copied()?;
+        let id: u32 = xf.attr_local("numFmtId")?.parse().ok()?;
+        if let Some(kind) = builtin_date_kind(id) {
+            return Some(kind);
+        }
+        if id >= 164 {
+            let code = self
+                .styles
+                .child("numFmts")?
+                .children_named("numFmt")
+                .into_iter()
+                .find(|f| {
+                    f.attr_local("numFmtId").and_then(|v| v.parse::<u32>().ok()) == Some(id)
+                })
+                .and_then(|f| f.attr_local("formatCode"))?
+                .to_string();
+            return code_date_kind(&code);
+        }
+        None
     }
 
     fn cell_info(&self, sheet: &Sheet, c: &XmlElement, path: &str) -> NodeInfo {
@@ -191,7 +233,36 @@ impl Xlsx {
         props: &Props,
     ) -> Result<NodeInfo> {
         // Style props are computed against the current cell first.
-        let style_props = StyleRequest::from_props(props)?;
+        let mut style_props = StyleRequest::from_props(props)?;
+
+        // ISO dates/times become serial numbers with a date number format
+        // (opt out with type=string, force with type=date).
+        let mut value_override: Option<String> = None;
+        if let Some(value) = props.get("value") {
+            let hint = props.get("type").map(|t| t.to_ascii_lowercase());
+            let hint = hint.as_deref();
+            let date_requested = matches!(hint, Some("date") | Some("datetime") | Some("time"));
+            if (hint.is_none() || date_requested) && !value.starts_with('=') {
+                if let Some((serial, has_date, has_time)) = parse_iso_datetime(value) {
+                    value_override = Some(format!("{serial}"));
+                    if style_props.num_fmt.is_none() {
+                        style_props.num_fmt = Some(
+                            match (has_date, has_time) {
+                                (true, true) => "datetime",
+                                (false, true) => "time",
+                                _ => "date",
+                            }
+                            .to_string(),
+                        );
+                    }
+                } else if date_requested {
+                    bail!(
+                        "'{value}' is not a date/time (YYYY-MM-DD, YYYY-MM-DD HH:MM[:SS], or HH:MM:SS)"
+                    );
+                }
+            }
+        }
+
         let new_style = if style_props.any() {
             let current_s = self.sheets[sheet_idx]
                 .xml
@@ -214,7 +285,9 @@ impl Xlsx {
                 .context("worksheet has no <sheetData>")?;
             let c = ensure_cell(sheet_data, col, row);
 
-            if let Some(value) = props.get("value") {
+            if let Some(serial) = &value_override {
+                write_cell_value(c, serial, Some("number"))?;
+            } else if let Some(value) = props.get("value") {
                 write_cell_value(c, value, props.get("type"))?;
             } else if let Some(formula) = props.get("formula") {
                 write_cell_formula(c, formula);
@@ -738,6 +811,75 @@ impl Xlsx {
         Ok(Report::Nodes(vec![info]))
     }
 
+    /// Attach a hyperlink to a cell: worksheet <hyperlinks> entry, external
+    /// relationship in the sheet's rels, and link styling.
+    fn set_cell_hyperlink(&mut self, sheet_idx: usize, col: u32, row0: u32, url: &str) -> Result<()> {
+        // Cells need visible text; default to the URL itself.
+        if self.value_at(sheet_idx, col, row0).is_empty() {
+            let value_props = Props::from_pairs(vec![
+                ("value".to_string(), url.to_string()),
+                ("type".to_string(), "string".to_string()),
+            ]);
+            self.set_cell(sheet_idx, col, row0, &value_props)?;
+        }
+        let style_props = Props::from_pairs(vec![
+            ("color".to_string(), "0563C1".to_string()),
+            ("underline".to_string(), "true".to_string()),
+        ]);
+        self.set_cell(sheet_idx, col, row0, &style_props)?;
+
+        let sheet_part = self.sheets[sheet_idx].part.clone();
+        let rels_part = sheet_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        let mut rels = if self.pkg.has_part(&rels_part) {
+            self.pkg.xml(&rels_part)?
+        } else {
+            crate::xml::parse(EMPTY_RELS_XML.as_bytes())?
+        };
+        let rid = crate::media::add_external_relationship(
+            &mut rels,
+            crate::media::HYPERLINK_REL_TYPE,
+            url,
+        );
+        self.pkg.put_xml(&rels_part, &rels)?;
+
+        let target = cell_name(col, row0);
+        let sheet_xml = &mut self.sheets[sheet_idx].xml;
+        if sheet_xml.attr("xmlns:r").is_none() {
+            sheet_xml.set_attr(
+                "xmlns:r",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            );
+        }
+        // <hyperlinks> sits after sheetData, before print/page/drawing parts.
+        if sheet_xml.child("hyperlinks").is_none() {
+            let mut at = sheet_xml.children.len();
+            for (i, node) in sheet_xml.children.iter().enumerate() {
+                if let XmlNode::Element(e) = node {
+                    if matches!(
+                        e.local_name(),
+                        "printOptions" | "pageMargins" | "pageSetup" | "drawing"
+                    ) {
+                        at = i;
+                        break;
+                    }
+                }
+            }
+            sheet_xml
+                .children
+                .insert(at, XmlNode::Element(XmlElement::new("hyperlinks")));
+        }
+        let links = sheet_xml.child_mut("hyperlinks").unwrap();
+        links.children.retain(|n| {
+            !matches!(n, XmlNode::Element(e)
+                if e.local_name() == "hyperlink" && e.attr_local("ref") == Some(target.as_str()))
+        });
+        links.push(el(
+            "hyperlink",
+            &[("ref", target.as_str()), ("r:id", rid.as_str())],
+        ));
+        Ok(())
+    }
+
     fn save_sheets(&mut self) -> Result<()> {
         // Ensure recalculation of formulas on open.
         let calc = self.workbook.ensure_child("calcPr", "calcPr", false);
@@ -754,6 +896,275 @@ impl Xlsx {
 
 fn parse_cell_ref_opt(r: &str) -> Option<(u32, u32)> {
     parse_cell_ref(r)
+}
+
+// -------------------------------------------------------------- csv ----
+
+/// RFC 4180-ish CSV parser: quoted fields, doubled quotes, CRLF or LF.
+fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut field_started = false;
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '"' => {
+                    if chars.peek() == Some(&'"') {
+                        field.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                c => field.push(c),
+            }
+        } else {
+            match c {
+                '"' if field.is_empty() => {
+                    in_quotes = true;
+                    field_started = true;
+                }
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    field_started = false;
+                }
+                '\r' => {}
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    field_started = false;
+                }
+                c => field.push(c),
+            }
+        }
+    }
+    if !field.is_empty() || field_started || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+// ------------------------------------------------------------- dates ----
+// Excel stores dates as serial numbers: days since 1899-12-30, with the
+// time of day as the fraction.
+
+/// Days from 1970-01-01 (Howard Hinnant's days-from-civil algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+const UNIX_EPOCH_SERIAL: f64 = 25_569.0; // 1970-01-01 as an Excel serial
+
+/// Parse `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` (or `T` separator), or a
+/// bare `HH:MM:SS` into (serial, has_date, has_time).
+fn parse_iso_datetime(s: &str) -> Option<(f64, bool, bool)> {
+    let s = s.trim();
+    let parse_time = |t: &str| -> Option<f64> {
+        let parts: Vec<&str> = t.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 {
+            return None;
+        }
+        let h: u32 = parts[0].parse().ok().filter(|h| *h < 24)?;
+        let m: u32 = parts[1].parse().ok().filter(|m| *m < 60)?;
+        let sec: f64 = if parts.len() == 3 {
+            parts[2].parse().ok().filter(|s| *s < 60.0)?
+        } else {
+            0.0
+        };
+        if parts[0].len() > 2 || parts[1].len() != 2 {
+            return None;
+        }
+        Some((h as f64 * 3600.0 + m as f64 * 60.0 + sec) / 86_400.0)
+    };
+    // Bare time.
+    if s.contains(':') && !s.contains('-') {
+        return parse_time(s).map(|frac| (frac, false, true));
+    }
+    let (date_part, time_part) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let dp: Vec<&str> = date_part.split('-').collect();
+    if dp.len() != 3 || dp[0].len() != 4 || dp[1].len() != 2 || dp[2].len() != 2 {
+        return None;
+    }
+    let y: i64 = dp[0].parse().ok()?;
+    let m: u32 = dp[1].parse().ok().filter(|m| (1..=12).contains(m))?;
+    let d: u32 = dp[2].parse().ok().filter(|d| (1..=31).contains(d))?;
+    let serial = days_from_civil(y, m, d) as f64 + UNIX_EPOCH_SERIAL;
+    match time_part {
+        Some(t) => parse_time(t).map(|frac| (serial + frac, true, true)),
+        None => Some((serial, true, false)),
+    }
+}
+
+/// Render a serial back as ISO (date / datetime / time as appropriate).
+fn serial_to_iso(serial: f64, with_date: bool, with_time: bool) -> String {
+    let days = serial.floor() as i64;
+    let mut secs = ((serial - days as f64) * 86_400.0).round() as i64;
+    let mut days = days;
+    if secs >= 86_400 {
+        days += 1;
+        secs -= 86_400;
+    }
+    // civil-from-days (inverse of days_from_civil).
+    let z = days - UNIX_EPOCH_SERIAL as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let date = format!("{:04}-{:02}-{:02}", y, m, d);
+    let time = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
+    match (with_date, with_time) {
+        (true, true) => format!("{date} {time}"),
+        (false, true) => time,
+        _ => date,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DateKind {
+    Date,
+    DateTime,
+    Time,
+}
+
+/// Classify a number format code as date-like.
+fn code_date_kind(code: &str) -> Option<DateKind> {
+    // Strip literals in quotes and color/condition brackets.
+    let mut clean = String::new();
+    let mut in_quote = false;
+    let mut in_bracket = false;
+    for ch in code.chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            '[' if !in_quote => in_bracket = true,
+            ']' if !in_quote => in_bracket = false,
+            c if !in_quote && !in_bracket => clean.push(c.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    let has_time = clean.contains('h') || clean.contains("ss");
+    let has_date = clean.contains('y') || clean.contains('d');
+    match (has_date, has_time) {
+        (true, true) => Some(DateKind::DateTime),
+        (true, false) => Some(DateKind::Date),
+        (false, true) => Some(DateKind::Time),
+        _ => None,
+    }
+}
+
+fn builtin_date_kind(id: u32) -> Option<DateKind> {
+    match id {
+        14..=17 => Some(DateKind::Date),
+        18..=21 | 45..=47 => Some(DateKind::Time),
+        22 => Some(DateKind::DateTime),
+        _ => None,
+    }
+}
+
+/// Resolve a friendly format name (or raw code) to a numFmtId, creating a
+/// custom <numFmt> entry when needed.
+fn ensure_num_fmt(styles: &mut XmlElement, name: &str) -> u32 {
+    let builtin = match name.to_ascii_lowercase().as_str() {
+        "general" => Some(0),
+        "integer" | "int" | "0" => Some(1),
+        "decimal" | "0.00" => Some(2),
+        "thousands" | "#,##0" => Some(3),
+        "percent" | "0%" => Some(9),
+        "percent2" | "0.00%" => Some(10),
+        "date" => Some(14),
+        "time" => Some(21),
+        "datetime" => Some(22),
+        "text" => Some(49),
+        _ => None,
+    };
+    if let Some(id) = builtin {
+        return id;
+    }
+    let code = match name.to_ascii_lowercase().as_str() {
+        "currency" => "$#,##0.00",
+        _ => name,
+    };
+    // numFmts must be the first child of styleSheet.
+    let num_fmts = styles.ensure_child("numFmts", "numFmts", true);
+    if let Some(existing) = num_fmts
+        .children_named("numFmt")
+        .into_iter()
+        .find(|f| f.attr_local("formatCode") == Some(code))
+        .and_then(|f| f.attr_local("numFmtId"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        return existing;
+    }
+    let id = num_fmts
+        .children_named("numFmt")
+        .into_iter()
+        .filter_map(|f| f.attr_local("numFmtId").and_then(|v| v.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(163)
+        .max(163)
+        + 1;
+    num_fmts.push(el(
+        "numFmt",
+        &[("numFmtId", id.to_string().as_str()), ("formatCode", code)],
+    ));
+    let count = num_fmts.children_named("numFmt").len();
+    num_fmts.set_attr("count", &count.to_string());
+    id
+}
+
+/// Friendly name (or raw code) for a numFmtId, for dump replay.
+fn num_fmt_name(styles: &XmlElement, id: u32) -> Option<String> {
+    let name = match id {
+        0 => return None,
+        1 => "integer",
+        2 => "0.00",
+        3 => "thousands",
+        9 => "percent",
+        10 => "0.00%",
+        14 => "date",
+        21 => "time",
+        22 => "datetime",
+        49 => "text",
+        _ => {
+            return styles
+                .child("numFmts")
+                .and_then(|nf| {
+                    nf.children_named("numFmt")
+                        .into_iter()
+                        .find(|f| {
+                            f.attr_local("numFmtId").and_then(|v| v.parse::<u32>().ok())
+                                == Some(id)
+                        })
+                        .and_then(|f| f.attr_local("formatCode"))
+                        .map(|c| c.to_string())
+                })
+        }
+    };
+    Some(name.to_string())
 }
 
 fn load_shared_strings(pkg: &Package) -> Result<Vec<String>> {
@@ -968,6 +1379,9 @@ struct StyleRequest {
     size: Option<f64>,
     fill: Option<String>,
     font: Option<String>,
+    underline: Option<bool>,
+    /// Number format: friendly name or raw format code.
+    num_fmt: Option<String>,
 }
 
 impl StyleRequest {
@@ -984,6 +1398,8 @@ impl StyleRequest {
                 .map(parse_color)
                 .transpose()?,
             font: get("font").map(|s| s.to_string()),
+            underline: get("underline").map(parse_bool).transpose()?,
+            num_fmt: props.get("format").map(|s| s.to_string()),
         })
     }
 
@@ -994,6 +1410,8 @@ impl StyleRequest {
             || self.size.is_some()
             || self.fill.is_some()
             || self.font.is_some()
+            || self.underline.is_some()
+            || self.num_fmt.is_some()
     }
 }
 
@@ -1030,6 +1448,9 @@ fn ensure_style(styles: &mut XmlElement, current_xf: usize, req: &StyleRequest) 
     }
     if let Some(i) = req.italic {
         toggle(&mut font, "i", i);
+    }
+    if let Some(u) = req.underline {
+        toggle(&mut font, "u", u);
     }
     if let Some(color) = &req.color {
         let c = font.ensure_child("color", "color", false);
@@ -1077,6 +1498,11 @@ fn ensure_style(styles: &mut XmlElement, current_xf: usize, req: &StyleRequest) 
     if let Some(fid) = fill_id {
         xf.set_attr("fillId", &fid.to_string());
         xf.set_attr("applyFill", "1");
+    }
+    if let Some(fmt) = &req.num_fmt {
+        let id = ensure_num_fmt(styles, fmt);
+        xf.set_attr("numFmtId", &id.to_string());
+        xf.set_attr("applyNumberFormat", "1");
     }
     let xf_id = find_or_push(styles.ensure_child("cellXfs", "cellXfs", false), "xf", xf);
     Ok(xf_id)
@@ -1126,6 +1552,9 @@ fn style_props(styles: &XmlElement, xf_idx: usize) -> Vec<(String, String)> {
             if font.child("i").is_some() {
                 out.push(("italic".to_string(), "true".to_string()));
             }
+            if font.child("u").is_some() {
+                out.push(("underline".to_string(), "true".to_string()));
+            }
             if let Some(rgb) = font.child("color").and_then(|c| c.attr_local("rgb")) {
                 let hex = rgb.strip_prefix("FF").unwrap_or(rgb);
                 out.push(("color".to_string(), hex.to_string()));
@@ -1139,6 +1568,19 @@ fn style_props(styles: &XmlElement, xf_idx: usize) -> Vec<(String, String)> {
                 if name != "Calibri" {
                     out.push(("font".to_string(), name.to_string()));
                 }
+            }
+        }
+    }
+    if let Some(id) = xf
+        .attr_local("numFmtId")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|id| *id != 0)
+    {
+        // Date-like builtins are implied by the ISO value in the dump, but
+        // custom codes must be carried explicitly.
+        if let Some(name) = num_fmt_name(styles, id) {
+            if !matches!(name.as_str(), "date" | "datetime" | "time") {
+                out.push(("format".to_string(), name));
             }
         }
     }
@@ -1547,6 +1989,54 @@ impl Handler for Xlsx {
                 let sheet_idx = self.sheet_index(&dpath.segments[0])?;
                 self.add_chart(sheet_idx, props)
             }
+            "csv" => {
+                if dpath.segments.is_empty() {
+                    bail!("csv is imported into a sheet, e.g. officecli add data.xlsx /Sheet1 --type csv --prop src=file.csv");
+                }
+                let sheet_idx = self.sheet_index(&dpath.segments[0])?;
+                let text = if let Some(src) = props.get("src") {
+                    std::fs::read_to_string(src)
+                        .with_context(|| format!("cannot read CSV file '{src}'"))?
+                } else if let Some(data) = props.get("data") {
+                    data.replace("\\n", "\n")
+                } else {
+                    bail!("csv needs --prop src=file.csv (or inline --prop data=...)");
+                };
+                let (at_col, at_row) = props
+                    .get("at")
+                    .map(|a| {
+                        parse_cell_ref(a).with_context(|| format!("'{a}' is not a cell reference"))
+                    })
+                    .transpose()?
+                    .unwrap_or((0, 0));
+                let rows = parse_csv(&text);
+                let mut cells = 0usize;
+                let mut max_cols = 0usize;
+                for (ri, row) in rows.iter().enumerate() {
+                    max_cols = max_cols.max(row.len());
+                    for (ci, field) in row.iter().enumerate() {
+                        if field.is_empty() {
+                            continue;
+                        }
+                        let value_props =
+                            Props::from_pairs(vec![("value".to_string(), field.clone())]);
+                        self.set_cell(sheet_idx, at_col + ci as u32, at_row + ri as u32, &value_props)?;
+                        cells += 1;
+                    }
+                }
+                let sheet_name = self.sheets[sheet_idx].name.clone();
+                let to = cell_name(
+                    at_col + max_cols.saturating_sub(1) as u32,
+                    at_row + rows.len().saturating_sub(1) as u32,
+                );
+                let mut info = NodeInfo::new(
+                    format!("/{}/{}:{}", sheet_name, cell_name(at_col, at_row), to),
+                    "range",
+                );
+                info.attr("rows", rows.len().to_string());
+                info.attr("cells", cells.to_string());
+                Ok(Report::Nodes(vec![info]))
+            }
             "pivot" => {
                 let source_sheet = if dpath.segments.is_empty() {
                     0
@@ -1657,10 +2147,26 @@ impl Handler for Xlsx {
         let seg = &dpath.segments[1];
         let (col, row0) = parse_cell_ref(&seg.name)
             .with_context(|| format!("'{}' is not a cell reference like B2", seg.name))?;
-        if !props.has("value") && !props.has("formula") && !StyleRequest::from_props(props)?.any() {
-            bail!("set on a cell needs --prop value=... , formula=... , or style props (bold/italic/color/size/fill/font)");
+        if !props.has("value")
+            && !props.has("formula")
+            && !props.has("url")
+            && !StyleRequest::from_props(props)?.any()
+        {
+            bail!("set on a cell needs --prop value=... , formula=... , url=... , or style props (bold/italic/color/size/fill/font/format)");
         }
-        let info = self.set_cell(sheet_idx, col, row0, props)?;
+        let mut info = if props.has("value") || props.has("formula") || StyleRequest::from_props(props)?.any() {
+            self.set_cell(sheet_idx, col, row0, props)?
+        } else {
+            NodeInfo::new(
+                format!("/{}/{}", self.sheets[sheet_idx].name, cell_name(col, row0)),
+                "cell",
+            )
+        };
+        if let Some(url) = props.get("url") {
+            let url = url.to_string();
+            self.set_cell_hyperlink(sheet_idx, col, row0, &url)?;
+            info.attr("url", url);
+        }
         Ok(Report::Nodes(vec![info]))
     }
 
@@ -1868,6 +2374,138 @@ impl Handler for Xlsx {
             text: format!("moved sheet '{name}' to position {}", to + 1),
             data: json!({ "moved": name, "position": to + 1 }),
         })
+    }
+
+    fn export_csv(&mut self, sheet: Option<&str>, range: Option<&str>) -> Result<String> {
+        let default_idx = match sheet {
+            Some(name) => self
+                .sheets
+                .iter()
+                .position(|s| s.name == name)
+                .with_context(|| format!("no sheet named '{name}'"))?,
+            None => 0,
+        };
+        let (idx, (c0, r0), (c1, r1)) = match range {
+            Some(spec) => self.parse_range_spec(default_idx, spec)?,
+            None => match Self::used_range(&self.sheets[default_idx]) {
+                Some((from, to)) => (default_idx, from, to),
+                None => return Ok(String::new()),
+            },
+        };
+        let mut out = String::new();
+        for r in r0..=r1 {
+            let mut fields = Vec::new();
+            for col in c0..=c1 {
+                fields.push(csv_field(&self.value_at(idx, col, r)));
+            }
+            out.push_str(&fields.join(","));
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    fn copy_el(&mut self, path_str: &str, pos: &Position) -> Result<Report> {
+        let dpath = path::parse(path_str)?;
+        if dpath.is_root() {
+            bail!("cannot copy the workbook root");
+        }
+        let sheet_idx = self.sheet_index(&dpath.segments[0])?;
+
+        // Copy a whole sheet.
+        if dpath.segments.len() == 1 {
+            let src_name = self.sheets[sheet_idx].name.clone();
+            let src_part = self.sheets[sheet_idx].part.clone();
+            let src_xml = self.sheets[sheet_idx].xml.clone();
+            let mut n = 2;
+            let mut name = format!("{src_name} ({n})");
+            while self.sheets.iter().any(|s| s.name == name) {
+                n += 1;
+                name = format!("{src_name} ({n})");
+            }
+            let new_idx = self.create_sheet(&name)?;
+            self.sheets[new_idx].xml = src_xml;
+            // The sheet's rels (hyperlinks, drawings) must travel with it,
+            // or its r:id references dangle.
+            let src_rels_part =
+                src_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+            if self.pkg.has_part(&src_rels_part) {
+                let bytes = self.pkg.raw(&src_rels_part)?.to_vec();
+                let new_rels_part = self.sheets[new_idx]
+                    .part
+                    .replace("xl/worksheets/", "xl/worksheets/_rels/")
+                    + ".rels";
+                self.pkg.put_raw(&new_rels_part, bytes);
+            }
+            let mut info = NodeInfo::new(format!("/{name}"), "sheet");
+            info.attr("copied-from", src_name);
+            return Ok(Report::Nodes(vec![info]));
+        }
+
+        // Copy a row: duplicate below the original (or at --index).
+        let seg = &dpath.segments[1];
+        if seg.name.eq_ignore_ascii_case("row") {
+            let src_num = seg.index().context("row needs an index, e.g. row[5]")? as u32;
+            let src_row = {
+                let sd = self.sheets[sheet_idx]
+                    .xml
+                    .child("sheetData")
+                    .context("worksheet has no <sheetData>")?;
+                find_row(sd, src_num)
+                    .with_context(|| format!("row {src_num} has no content"))?
+                    .clone()
+            };
+            let dest_num: u32 = match pos {
+                Position::Append => src_num + 1,
+                Position::Index(n) => *n as u32,
+                _ => bail!("copy row supports --index N (1-based destination row)"),
+            };
+            if dest_num == 0 {
+                bail!("row numbers are 1-based");
+            }
+            // Make room, then materialize the clone at its new number.
+            {
+                let sd = self.sheets[sheet_idx].xml.child_mut("sheetData").unwrap();
+                shift_rows_down(sd, dest_num);
+            }
+            self.rewrite_all_formulas(sheet_idx, &Shift::Rows { from: dest_num, delta: 1 });
+            {
+                let mut clone = src_row;
+                clone.set_attr("r", &dest_num.to_string());
+                for cnode in clone.children.iter_mut() {
+                    if let XmlNode::Element(c) = cnode {
+                        if c.local_name() == "c" {
+                            if let Some((col, _)) = c.attr_local("r").and_then(parse_cell_ref_opt)
+                            {
+                                c.set_attr("r", &cell_name(col, dest_num - 1));
+                            }
+                        }
+                    }
+                }
+                let sd = self.sheets[sheet_idx].xml.child_mut("sheetData").unwrap();
+                // Insert keeping rows ordered.
+                let mut at = sd.children.len();
+                for (i, node) in sd.children.iter().enumerate() {
+                    if let XmlNode::Element(e) = node {
+                        if e.local_name() == "row" {
+                            let r: u32 = e
+                                .attr_local("r")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(u32::MAX);
+                            if r > dest_num {
+                                at = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                sd.children.insert(at, XmlNode::Element(clone));
+            }
+            let sheet_name = &self.sheets[sheet_idx].name;
+            let mut info = NodeInfo::new(format!("/{sheet_name}/row[{dest_num}]"), "row");
+            info.attr("copied-from", format!("/{sheet_name}/row[{src_num}]"));
+            return Ok(Report::Nodes(vec![info]));
+        }
+        bail!("xlsx copy supports a sheet (/Sheet1) or a row (/Sheet1/row[5])")
     }
 
     fn screenshot(&mut self) -> Result<Vec<Vec<u8>>> {
@@ -2177,6 +2815,35 @@ mod tests {
             rewrite_formula_refs("IF(A5>0,\"A5\",LOG10(A5))", "Sheet1", true, &Shift::Rows { from: 1, delta: 1 }),
             "IF(A6>0,\"A5\",LOG10(A6))"
         );
+    }
+
+    #[test]
+    fn date_serials_roundtrip() {
+        use super::{parse_iso_datetime, serial_to_iso};
+        let (s, d, t) = parse_iso_datetime("2026-07-10").unwrap();
+        assert_eq!(s, 46213.0);
+        assert!(d && !t);
+        assert_eq!(serial_to_iso(s, true, false), "2026-07-10");
+        let (s, _, _) = parse_iso_datetime("2026-07-10 14:30:00").unwrap();
+        assert_eq!(serial_to_iso(s, true, true), "2026-07-10 14:30:00");
+        let (s, d, t) = parse_iso_datetime("14:30").unwrap();
+        assert!(!d && t);
+        assert_eq!(serial_to_iso(s, false, true), "14:30:00");
+        assert!(parse_iso_datetime("not a date").is_none());
+        assert!(parse_iso_datetime("2026-13-01").is_none());
+    }
+
+    #[test]
+    fn csv_quoting() {
+        use super::{csv_field, parse_csv};
+        let rows = parse_csv("a,\"b,c\",\"say \"\"hi\"\"\"\r\nd,,f\n");
+        assert_eq!(rows, vec![
+            vec!["a".to_string(), "b,c".into(), "say \"hi\"".into()],
+            vec!["d".to_string(), "".into(), "f".into()],
+        ]);
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
     #[test]
