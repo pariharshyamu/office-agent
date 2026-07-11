@@ -5,7 +5,9 @@
 
 mod batch;
 mod chart;
+mod diff;
 mod docx;
+mod formula;
 mod handler;
 mod helptext;
 mod html;
@@ -44,6 +46,12 @@ use props::Props;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Write <file>.bak before modifying a document
+    #[arg(long, global = true)]
+    backup: bool,
+    /// Run the command but do not save changes
+    #[arg(long = "dry-run", global = true)]
+    dry_run: bool,
 }
 
 #[derive(Subcommand)]
@@ -77,6 +85,38 @@ enum Command {
         /// Expand children N levels deep
         #[arg(long, default_value_t = 0)]
         depth: usize,
+        /// Evaluate formulas and show results (xlsx)
+        #[arg(long)]
+        computed: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate a spreadsheet formula against a workbook (xlsx)
+    Calc {
+        file: PathBuf,
+        /// e.g. '=SUM(Sheet1!B2:B99)' or 'AVERAGE(A1:A9)*1.2'
+        formula: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two same-format documents content-wise
+    Diff {
+        file1: PathBuf,
+        file2: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sort a cell range in place by one of its columns (xlsx)
+    Sort {
+        file: PathBuf,
+        /// Range like 'Sheet1!A2:C99' (exclude the header row)
+        range: String,
+        /// Column to sort by: a letter within the range (e.g. B)
+        #[arg(long)]
+        by: String,
+        /// Sort descending
+        #[arg(long)]
+        desc: bool,
         #[arg(long)]
         json: bool,
     },
@@ -207,6 +247,9 @@ enum Command {
         /// Abort on the first failing operation
         #[arg(long)]
         stop_on_error: bool,
+        /// Save nothing unless every operation succeeded (all-or-nothing)
+        #[arg(long)]
+        atomic: bool,
         #[arg(long)]
         json: bool,
     },
@@ -279,8 +322,26 @@ pub(crate) fn execute_args(args: Vec<String>, allow_stdin: bool) -> Result<(Repo
     Ok((outcome.report, outcome.ok))
 }
 
+/// Save the handler back to disk, honoring `--backup` and `--dry-run`.
+fn persist(handler: &mut dyn Handler, file: &Path, backup: bool, dry_run: bool) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    if backup && file.exists() {
+        let mut bak = file.as_os_str().to_owned();
+        bak.push(".bak");
+        let bak = PathBuf::from(bak);
+        std::fs::copy(file, &bak)
+            .with_context(|| format!("cannot write backup {}", bak.display()))?;
+    }
+    handler.save(file)
+}
+
 fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
     let done = |report: Report, json: bool| Ok(Outcome { report, json, ok: true });
+    let backup = cli.backup;
+    let dry_run = cli.dry_run;
+    let save = |handler: &mut dyn Handler, file: &Path| persist(handler, file, backup, dry_run);
     match cli.command {
         Command::Create { file, force, json } => {
             let kind = DocKind::from_path(&file)?;
@@ -351,10 +412,57 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             file,
             path,
             depth,
+            computed,
             json,
         } => {
             let mut handler = open_handler(&file)?;
-            done(handler.get(&path, depth)?, json)
+            done(handler.get(&path, depth, computed)?, json)
+        }
+        Command::Calc { file, formula, json } => {
+            let mut handler = open_handler(&file)?;
+            done(handler.calc(&formula)?, json)
+        }
+        Command::Diff { file1, file2, json } => {
+            let k1 = DocKind::from_path(&file1)?;
+            let k2 = DocKind::from_path(&file2)?;
+            if k1 != k2 {
+                bail!(
+                    "cannot diff a {} against a {} (different formats)",
+                    k1.format_name(),
+                    k2.format_name()
+                );
+            }
+            let mut h1 = open_handler(&file1)?;
+            let mut h2 = open_handler(&file2)?;
+            let (t1, t2) = (h1.tree()?, h2.tree()?);
+            let changes = diff::diff(&t1, &t2);
+            let summary = format!("{} change(s)", changes.len());
+            match changes.is_empty() {
+                true => done(Report::message("documents are identical"), json),
+                false => done(
+                    Report::Data {
+                        text: {
+                            let mut nodes = out::Report::Nodes(changes.clone()).render(false);
+                            nodes.push_str(&format!("\n{summary}"));
+                            nodes
+                        },
+                        data: serde_json::json!({ "changes": changes, "count": changes.len() }),
+                    },
+                    json,
+                ),
+            }
+        }
+        Command::Sort {
+            file,
+            range,
+            by,
+            desc,
+            json,
+        } => {
+            let mut handler = open_handler(&file)?;
+            let report = handler.sort(&range, &by, desc)?;
+            save(handler.as_mut(), &file)?;
+            done(report, json)
         }
         Command::Query {
             file,
@@ -381,7 +489,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             let pos = position(index, before, after);
             let mut handler = open_handler(&file)?;
             let report = handler.add(&parent, &typ, &props, &pos)?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Set {
@@ -395,7 +503,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             let props = Props::from_args(&props)?;
             let mut handler = open_handler(&file)?;
             let report = handler.set(&path, &props, find.as_deref(), replace.as_deref())?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Move {
@@ -410,7 +518,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             let pos = position(index, before, after);
             let mut handler = open_handler(&file)?;
             let report = handler.move_el(&path, to.as_deref(), &pos)?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Swap {
@@ -421,7 +529,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
         } => {
             let mut handler = open_handler(&file)?;
             let report = handler.swap(&path1, &path2)?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Copy {
@@ -435,7 +543,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             let pos = position(index, before, after);
             let mut handler = open_handler(&file)?;
             let report = handler.copy_el(&path, &pos)?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Export {
@@ -460,7 +568,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
         Command::Remove { file, path, json } => {
             let mut handler = open_handler(&file)?;
             let report = handler.remove(&path)?;
-            handler.save(&file)?;
+            save(handler.as_mut(), &file)?;
             done(report, json)
         }
         Command::Dump { file, json } => {
@@ -479,6 +587,7 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             commands,
             input,
             stop_on_error,
+            atomic,
             json,
         } => {
             let source = if let Some(inline) = commands {
@@ -498,8 +607,10 @@ fn run_command(cli: Cli, allow_stdin: bool) -> Result<Outcome> {
             };
             let mut handler = open_handler(&file)?;
             let (report, all_ok) = batch::run_batch(handler.as_mut(), &source, stop_on_error)?;
-            // Save partial progress even when some items failed.
-            handler.save(&file)?;
+            // Non-atomic keeps partial progress; --atomic discards it on any failure.
+            if all_ok || !atomic {
+                save(handler.as_mut(), &file)?;
+            }
             Ok(Outcome {
                 report,
                 json,
@@ -554,9 +665,13 @@ fn main() {
     // `--json` errors also go to stdout as a JSON envelope so agents can
     // parse failures uniformly.
     let wants_json = std::env::args().any(|a| a == "--json");
+    let dry_run = std::env::args().any(|a| a == "--dry-run");
     match run_command(Cli::parse(), true) {
         Ok(outcome) => {
             println!("{}", outcome.report.render(outcome.json));
+            if dry_run && !outcome.json {
+                eprintln!("(dry run — no changes written)");
+            }
             if !outcome.ok {
                 std::process::exit(1);
             }

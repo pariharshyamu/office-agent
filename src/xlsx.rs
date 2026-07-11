@@ -850,25 +850,7 @@ impl Xlsx {
                 "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
             );
         }
-        // <hyperlinks> sits after sheetData, before print/page/drawing parts.
-        if sheet_xml.child("hyperlinks").is_none() {
-            let mut at = sheet_xml.children.len();
-            for (i, node) in sheet_xml.children.iter().enumerate() {
-                if let XmlNode::Element(e) = node {
-                    if matches!(
-                        e.local_name(),
-                        "printOptions" | "pageMargins" | "pageSetup" | "drawing"
-                    ) {
-                        at = i;
-                        break;
-                    }
-                }
-            }
-            sheet_xml
-                .children
-                .insert(at, XmlNode::Element(XmlElement::new("hyperlinks")));
-        }
-        let links = sheet_xml.child_mut("hyperlinks").unwrap();
+        let links = worksheet_child(sheet_xml, "hyperlinks");
         links.children.retain(|n| {
             !matches!(n, XmlNode::Element(e)
                 if e.local_name() == "hyperlink" && e.attr_local("ref") == Some(target.as_str()))
@@ -878,6 +860,24 @@ impl Xlsx {
             &[("ref", target.as_str()), ("r:id", rid.as_str())],
         ));
         Ok(())
+    }
+
+    /// Replace a cell's text with its computed value when it's a formula.
+    fn attach_computed(&self, sheet_idx: usize, col: u32, row: u32, info: &mut NodeInfo) {
+        let sheet = &self.sheets[sheet_idx];
+        let formula = sheet
+            .xml
+            .child("sheetData")
+            .and_then(|sd| find_row(sd, row + 1))
+            .and_then(|r| find_cell(r, col, row))
+            .and_then(|c| c.child("f"))
+            .map(|f| f.text_content());
+        let Some(formula) = formula else { return };
+        let ev = crate::formula::Evaluator::new(self);
+        let v = ev.eval_formula(&sheet.name, &formula);
+        info.attr("computed", "true");
+        info.attr("value-type", v.type_name());
+        info.text = Some(v.display());
     }
 
     fn save_sheets(&mut self) -> Result<()> {
@@ -894,6 +894,54 @@ impl Xlsx {
     }
 }
 
+impl crate::formula::CellSource for Xlsx {
+    fn cell(&self, sheet: &str, col: u32, row: u32) -> crate::formula::CellContent {
+        use crate::formula::CellContent;
+        let Some(idx) = self
+            .sheets
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(sheet))
+        else {
+            return CellContent::Error("#REF!".into());
+        };
+        let s = &self.sheets[idx];
+        let Some(c) = s
+            .xml
+            .child("sheetData")
+            .and_then(|sd| find_row(sd, row + 1))
+            .and_then(|r| find_cell(r, col, row))
+        else {
+            return CellContent::Empty;
+        };
+        if let Some(f) = c.child("f") {
+            return CellContent::Formula(f.text_content());
+        }
+        let t = c.attr_local("t").unwrap_or("n");
+        let v = c.child("v").map(|v| v.text_content()).unwrap_or_default();
+        match t {
+            "s" => {
+                let i: usize = v.trim().parse().unwrap_or(usize::MAX);
+                CellContent::Text(self.shared.get(i).cloned().unwrap_or_default())
+            }
+            "str" => CellContent::Text(v),
+            "inlineStr" => {
+                CellContent::Text(c.child("is").map(|is| is.text_content()).unwrap_or_default())
+            }
+            "b" => CellContent::Bool(v.trim() == "1"),
+            "e" => CellContent::Error(v),
+            _ => match v.trim().parse::<f64>() {
+                Ok(n) => CellContent::Number(n),
+                Err(_) if v.trim().is_empty() => CellContent::Empty,
+                Err(_) => CellContent::Error("#VALUE!".into()),
+            },
+        }
+    }
+
+    fn has_sheet(&self, sheet: &str) -> bool {
+        self.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(sheet))
+    }
+}
+
 fn parse_cell_ref_opt(r: &str) -> Option<(u32, u32)> {
     parse_cell_ref(r)
 }
@@ -901,7 +949,7 @@ fn parse_cell_ref_opt(r: &str) -> Option<(u32, u32)> {
 // -------------------------------------------------------------- csv ----
 
 /// RFC 4180-ish CSV parser: quoted fields, doubled quotes, CRLF or LF.
-fn parse_csv(text: &str) -> Vec<Vec<String>> {
+pub(crate) fn parse_csv(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
@@ -972,6 +1020,27 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 
 const UNIX_EPOCH_SERIAL: f64 = 25_569.0; // 1970-01-01 as an Excel serial
 
+/// Excel serial for a civil date (shared with the formula evaluator).
+pub(crate) fn date_serial(y: i64, m: u32, d: u32) -> f64 {
+    days_from_civil(y, m, d) as f64 + UNIX_EPOCH_SERIAL
+}
+
+/// (year, month, day) of an Excel serial (shared with the evaluator).
+pub(crate) fn serial_civil(serial: f64) -> (i64, u32, u32) {
+    let days = serial.floor() as i64;
+    let z = days - UNIX_EPOCH_SERIAL as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
 /// Parse `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` (or `T` separator), or a
 /// bare `HH:MM:SS` into (serial, has_date, has_time).
 fn parse_iso_datetime(s: &str) -> Option<(f64, bool, bool)> {
@@ -1017,24 +1086,14 @@ fn parse_iso_datetime(s: &str) -> Option<(f64, bool, bool)> {
 
 /// Render a serial back as ISO (date / datetime / time as appropriate).
 fn serial_to_iso(serial: f64, with_date: bool, with_time: bool) -> String {
-    let days = serial.floor() as i64;
-    let mut secs = ((serial - days as f64) * 86_400.0).round() as i64;
+    let days = serial.floor();
+    let mut secs = ((serial - days) * 86_400.0).round() as i64;
     let mut days = days;
     if secs >= 86_400 {
-        days += 1;
+        days += 1.0;
         secs -= 86_400;
     }
-    // civil-from-days (inverse of days_from_civil).
-    let z = days - UNIX_EPOCH_SERIAL as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d) = serial_civil(days);
     let date = format!("{:04}-{:02}-{:02}", y, m, d);
     let time = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
     match (with_date, with_time) {
@@ -1180,6 +1239,36 @@ fn load_shared_strings(pkg: &Package) -> Result<Vec<String>> {
 }
 
 const EMPTY_RELS_XML: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
+
+/// Get-or-create a worksheet child at its schema-mandated position.
+fn worksheet_child<'a>(sheet_xml: &'a mut XmlElement, name: &str) -> &'a mut XmlElement {
+    const ORDER: &[&str] = &[
+        "sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData",
+        "sheetCalcPr", "sheetProtection", "autoFilter", "sortState", "mergeCells",
+        "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions",
+        "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "drawing",
+    ];
+    if sheet_xml.child(name).is_none() {
+        let rank = ORDER.iter().position(|o| *o == name).unwrap_or(ORDER.len());
+        let mut at = sheet_xml.children.len();
+        for (i, node) in sheet_xml.children.iter().enumerate() {
+            if let XmlNode::Element(e) = node {
+                let r = ORDER
+                    .iter()
+                    .position(|o| *o == e.local_name())
+                    .unwrap_or(ORDER.len());
+                if r > rank {
+                    at = i;
+                    break;
+                }
+            }
+        }
+        sheet_xml
+            .children
+            .insert(at, XmlNode::Element(XmlElement::new(name)));
+    }
+    sheet_xml.child_mut(name).unwrap()
+}
 
 fn next_rid(rels: &XmlElement) -> String {
     let n = rels
@@ -1700,7 +1789,7 @@ impl Handler for Xlsx {
         }
     }
 
-    fn get(&mut self, path_str: &str, depth: usize) -> Result<Report> {
+    fn get(&mut self, path_str: &str, depth: usize, computed: bool) -> Result<Report> {
         let dpath = path::parse(path_str)?;
         if dpath.is_root() {
             let mut info = NodeInfo::new("/", "workbook");
@@ -1773,7 +1862,11 @@ impl Handler for Xlsx {
                     for col in c0.min(c1)..=c0.max(c1) {
                         if let Some(c) = find_cell(row, col, r) {
                             let cpath = format!("/{}/{}", sheet.name, cell_name(col, r));
-                            nodes.push(self.cell_info(sheet, c, &cpath));
+                            let mut info = self.cell_info(sheet, c, &cpath);
+                            if computed {
+                                self.attach_computed(sheet_idx, col, r, &mut info);
+                            }
+                            nodes.push(info);
                         }
                     }
                 }
@@ -1782,7 +1875,7 @@ impl Handler for Xlsx {
             if let Some((col, row0)) = parse_cell_ref(&seg.name) {
                 let sd = sheet.xml.child("sheetData").context("no sheetData")?;
                 let cpath = format!("/{}/{}", sheet.name, cell_name(col, row0));
-                let info = match find_row(sd, row0 + 1).and_then(|r| find_cell(r, col, row0)) {
+                let mut info = match find_row(sd, row0 + 1).and_then(|r| find_cell(r, col, row0)) {
                     Some(c) => self.cell_info(sheet, c, &cpath),
                     None => {
                         let mut info = NodeInfo::new(cpath, "cell");
@@ -1791,6 +1884,9 @@ impl Handler for Xlsx {
                         info
                     }
                 };
+                if computed {
+                    self.attach_computed(sheet_idx, col, row0, &mut info);
+                }
                 return Ok(Report::Nodes(vec![info]));
             }
         }
@@ -2145,6 +2241,118 @@ impl Handler for Xlsx {
         }
 
         let seg = &dpath.segments[1];
+
+        // Range: merge / unmerge.
+        if seg.name.contains(':') {
+            let merge = props
+                .get_bool("merge")?
+                .context("set on a range supports --prop merge=true|false")?;
+            let (_, (c0, r0), (c1, r1)) =
+                self.parse_range_spec(sheet_idx, &format!("{}!{}", self.sheets[sheet_idx].name, seg.name))?;
+            let reference = format!("{}:{}", cell_name(c0, r0), cell_name(c1, r1));
+            let sheet_xml = &mut self.sheets[sheet_idx].xml;
+            let merges = worksheet_child(sheet_xml, "mergeCells");
+            merges.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e)
+                    if e.local_name() == "mergeCell"
+                        && e.attr_local("ref") == Some(reference.as_str()))
+            });
+            if merge {
+                merges.push(el("mergeCell", &[("ref", reference.as_str())]));
+            }
+            let count = merges.children_named("mergeCell").len();
+            merges.set_attr("count", &count.to_string());
+            if count == 0 {
+                sheet_xml.children.retain(|n| {
+                    !matches!(n, XmlNode::Element(e) if e.local_name() == "mergeCells")
+                });
+            }
+            return Ok(Report::Data {
+                text: format!(
+                    "{} {} in {}",
+                    if merge { "merged" } else { "unmerged" },
+                    reference,
+                    self.sheets[sheet_idx].name
+                ),
+                data: json!({ "merged": merge, "ref": reference }),
+            });
+        }
+
+        // Row: height.
+        if seg.name.eq_ignore_ascii_case("row") {
+            let n = seg.index().context("row needs an index, e.g. row[5]")? as u32;
+            let height: f64 = props
+                .get("height")
+                .context("set on a row supports --prop height=N (points)")?
+                .parse()
+                .context("height must be a number of points")?;
+            let sheet_xml = &mut self.sheets[sheet_idx].xml;
+            let sd = sheet_xml
+                .child_mut("sheetData")
+                .context("worksheet has no <sheetData>")?;
+            ensure_row(sd, n);
+            for node in sd.children.iter_mut().filter_map(|x| x.as_element_mut()) {
+                if node.local_name() == "row"
+                    && node.attr_local("r").and_then(|v| v.parse::<u32>().ok()) == Some(n)
+                {
+                    node.set_attr("ht", &format_num(height));
+                    node.set_attr("customHeight", "1");
+                }
+            }
+            return Ok(Report::Data {
+                text: format!("set row {n} height to {} in {}", format_num(height), self.sheets[sheet_idx].name),
+                data: json!({ "row": n, "height": height }),
+            });
+        }
+
+        // Column: width.
+        let col_target: Option<u32> = if seg.name.eq_ignore_ascii_case("col")
+            || seg.name.eq_ignore_ascii_case("column")
+        {
+            Some(seg.index().context("column needs an index, e.g. col[2]")? as u32 - 1)
+        } else if seg.name.len() <= 3
+            && seg.name.chars().all(|c| c.is_ascii_alphabetic())
+            && parse_cell_ref(&seg.name).is_none()
+        {
+            letters_to_col(&seg.name)
+        } else {
+            None
+        };
+        if let Some(col) = col_target {
+            let width: f64 = props
+                .get("width")
+                .context("set on a column supports --prop width=N (characters)")?
+                .parse()
+                .context("width must be a number of characters")?;
+            let n = (col + 1).to_string();
+            let sheet_xml = &mut self.sheets[sheet_idx].xml;
+            let cols = worksheet_child(sheet_xml, "cols");
+            cols.children.retain(|node| {
+                !matches!(node, XmlNode::Element(e)
+                    if e.local_name() == "col"
+                        && e.attr_local("min") == Some(n.as_str())
+                        && e.attr_local("max") == Some(n.as_str()))
+            });
+            cols.push(el(
+                "col",
+                &[
+                    ("min", n.as_str()),
+                    ("max", n.as_str()),
+                    ("width", format_num(width).as_str()),
+                    ("customWidth", "1"),
+                ],
+            ));
+            return Ok(Report::Data {
+                text: format!(
+                    "set column {} width to {} in {}",
+                    col_letters(col),
+                    format_num(width),
+                    self.sheets[sheet_idx].name
+                ),
+                data: json!({ "column": col_letters(col), "width": width }),
+            });
+        }
+
         let (col, row0) = parse_cell_ref(&seg.name)
             .with_context(|| format!("'{}' is not a cell reference like B2", seg.name))?;
         if !props.has("value")
@@ -2373,6 +2581,138 @@ impl Handler for Xlsx {
         Ok(Report::Data {
             text: format!("moved sheet '{name}' to position {}", to + 1),
             data: json!({ "moved": name, "position": to + 1 }),
+        })
+    }
+
+    fn calc(&mut self, expr: &str) -> Result<Report> {
+        let sheet_name = self
+            .sheets
+            .first()
+            .map(|s| s.name.clone())
+            .context("workbook has no sheets")?;
+        let ev = crate::formula::Evaluator::new(&*self);
+        let v = ev.eval_formula(&sheet_name, expr);
+        Ok(Report::Data {
+            text: v.display(),
+            data: json!({ "value": v.display(), "type": v.type_name() }),
+        })
+    }
+
+    fn sort(&mut self, range: &str, by: &str, descending: bool) -> Result<Report> {
+        let (idx, (c0, r0), (c1, r1)) = self.parse_range_spec(0, range)?;
+        let by_col = letters_to_col(by)
+            .with_context(|| format!("--by needs a column letter like B, got '{by}'"))?;
+        if by_col < c0 || by_col > c1 {
+            bail!("--by column {by} is outside the range {range}");
+        }
+        // Sorting rearranges values; formulas would silently break.
+        {
+            let sheet = &self.sheets[idx];
+            let sd = sheet.xml.child("sheetData").context("no sheetData")?;
+            for r in r0..=r1 {
+                let Some(row) = find_row(sd, r + 1) else { continue };
+                for c in c0..=c1 {
+                    if find_cell(row, c, r).map(|c| c.child("f").is_some()).unwrap_or(false) {
+                        bail!(
+                            "range {range} contains formulas at {} — sort works on values only",
+                            cell_name(c, r)
+                        );
+                    }
+                }
+            }
+        }
+        // Snapshot the range's cell elements row by row.
+        let mut rows: Vec<Vec<Option<XmlElement>>> = Vec::new();
+        {
+            let sheet = &self.sheets[idx];
+            let sd = sheet.xml.child("sheetData").context("no sheetData")?;
+            for r in r0..=r1 {
+                let mut cells = Vec::new();
+                for c in c0..=c1 {
+                    cells.push(
+                        find_row(sd, r + 1)
+                            .and_then(|row| find_cell(row, c, r))
+                            .cloned(),
+                    );
+                }
+                rows.push(cells);
+            }
+        }
+        // Sort keys: numeric when possible, else case-insensitive text;
+        // empty cells always sink to the bottom.
+        let key_idx = (by_col - c0) as usize;
+        let display = |cell: &Option<XmlElement>| -> String {
+            cell.as_ref().map(|c| self.cell_display(c).0).unwrap_or_default()
+        };
+        rows.sort_by(|a, b| {
+            let (ka, kb) = (display(&a[key_idx]), display(&b[key_idx]));
+            match (ka.is_empty(), kb.is_empty()) {
+                (true, true) => return std::cmp::Ordering::Equal,
+                (true, false) => return std::cmp::Ordering::Greater,
+                (false, true) => return std::cmp::Ordering::Less,
+                _ => {}
+            }
+            let ord = match (ka.parse::<f64>(), kb.parse::<f64>()) {
+                (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => ka.to_lowercase().cmp(&kb.to_lowercase()),
+            };
+            if descending { ord.reverse() } else { ord }
+        });
+        // Write the rearranged cells back.
+        {
+            let sheet = &mut self.sheets[idx];
+            let sd = sheet.xml.child_mut("sheetData").context("no sheetData")?;
+            for (offset, cells) in rows.into_iter().enumerate() {
+                let target_row = r0 + offset as u32;
+                for (ci, cell) in cells.into_iter().enumerate() {
+                    let col = c0 + ci as u32;
+                    match cell {
+                        Some(mut cell) => {
+                            cell.set_attr("r", &cell_name(col, target_row));
+                            let slot = ensure_cell(sd, col, target_row);
+                            *slot = cell;
+                        }
+                        None => {
+                            // Clear any leftover value in this slot.
+                            if let Some(row) = sd
+                                .children
+                                .iter_mut()
+                                .filter_map(|n| n.as_element_mut())
+                                .find(|e| {
+                                    e.local_name() == "row"
+                                        && e.attr_local("r")
+                                            .and_then(|v| v.parse::<u32>().ok())
+                                            == Some(target_row + 1)
+                                })
+                            {
+                                let target = cell_name(col, target_row);
+                                row.children.retain(|n| {
+                                    !matches!(n, XmlNode::Element(e)
+                                        if e.local_name() == "c"
+                                            && e.attr_local("r") == Some(target.as_str()))
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let sheet_name = &self.sheets[idx].name;
+        Ok(Report::Data {
+            text: format!(
+                "sorted {} row(s) in {}!{}:{} by column {}{}",
+                r1 - r0 + 1,
+                sheet_name,
+                cell_name(c0, r0),
+                cell_name(c1, r1),
+                by.to_uppercase(),
+                if descending { " (descending)" } else { "" }
+            ),
+            data: json!({
+                "sorted": r1 - r0 + 1,
+                "by": by.to_uppercase(),
+                "descending": descending,
+            }),
         })
     }
 

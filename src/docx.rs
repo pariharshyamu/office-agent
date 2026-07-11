@@ -984,6 +984,222 @@ impl Docx {
         })
     }
 
+    /// Get (or create at the end of the body) the document-level sectPr.
+    fn sectpr_mut(&mut self) -> Result<&mut XmlElement> {
+        let body = self.body_mut()?;
+        Ok(body.ensure_child("sectPr", "w:sectPr", false))
+    }
+
+    /// Document-level page setup: orientation, page-size, margins.
+    fn apply_page_setup(&mut self, props: &Props) -> Result<Vec<String>> {
+        let mut changed = Vec::new();
+        // Sizes in twips (1/20 pt): EMU / 635.
+        let to_twips = |v: &str| -> Result<i64> { Ok(crate::props::parse_emu(v)? / 635) };
+
+        if let Some(size) = props.get("page-size").or_else(|| props.get("pagesize")) {
+            let (w, h) = match size.to_ascii_lowercase().as_str() {
+                "letter" => (12_240, 15_840),
+                "a4" => (11_906, 16_838),
+                "a3" => (16_838, 23_811),
+                "legal" => (12_240, 20_160),
+                custom => match custom.split_once('x') {
+                    Some((w, h)) => (to_twips(w)?, to_twips(h)?),
+                    None => bail!("page-size is letter/a4/a3/legal or WxH (e.g. 8.5inx11in)"),
+                },
+            };
+            let sectpr = self.sectpr_mut()?;
+            let pgsz = sectpr.ensure_child("pgSz", "w:pgSz", true);
+            pgsz.set_attr("w:w", &w.to_string());
+            pgsz.set_attr("w:h", &h.to_string());
+            changed.push(format!("page-size={size}"));
+        }
+        if let Some(orientation) = props.get("orientation") {
+            let landscape = match orientation.to_ascii_lowercase().as_str() {
+                "landscape" => true,
+                "portrait" => false,
+                other => bail!("orientation is portrait or landscape, got '{other}'"),
+            };
+            let sectpr = self.sectpr_mut()?;
+            let pgsz = sectpr.ensure_child("pgSz", "w:pgSz", true);
+            let w: i64 = pgsz.attr("w:w").and_then(|v| v.parse().ok()).unwrap_or(12_240);
+            let h: i64 = pgsz.attr("w:h").and_then(|v| v.parse().ok()).unwrap_or(15_840);
+            let currently_landscape = pgsz.attr("w:orient") == Some("landscape");
+            if landscape != currently_landscape {
+                pgsz.set_attr("w:w", &h.to_string());
+                pgsz.set_attr("w:h", &w.to_string());
+            }
+            if landscape {
+                pgsz.set_attr("w:orient", "landscape");
+            } else {
+                pgsz.remove_attr("w:orient");
+            }
+            changed.push(format!("orientation={orientation}"));
+        }
+        let uniform = props.get("margins").or_else(|| props.get("margin"));
+        let sides = [
+            ("margin-top", "w:top"),
+            ("margin-right", "w:right"),
+            ("margin-bottom", "w:bottom"),
+            ("margin-left", "w:left"),
+        ];
+        if uniform.is_some() || sides.iter().any(|(k, _)| props.has(k)) {
+            let uniform_twips = uniform.map(to_twips).transpose()?;
+            let mut values = Vec::new();
+            for (key, attr) in sides {
+                let v = match props.get(key) {
+                    Some(v) => Some(to_twips(v)?),
+                    None => uniform_twips,
+                };
+                values.push((attr, v));
+            }
+            let sectpr = self.sectpr_mut()?;
+            let pgmar = sectpr.ensure_child("pgMar", "w:pgMar", false);
+            for (attr, v) in values {
+                if let Some(v) = v {
+                    pgmar.set_attr(attr, &v.to_string());
+                }
+            }
+            changed.push("margins".to_string());
+        }
+        Ok(changed)
+    }
+
+    /// Add (or replace) the default header or footer.
+    fn add_header_footer(&mut self, kind: &str, props: &Props) -> Result<Report> {
+        let is_header = kind == "header";
+        let (root_name, rel_kind, ct) = if is_header {
+            (
+                "w:hdr",
+                "header",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+            )
+        } else {
+            (
+                "w:ftr",
+                "footer",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+            )
+        };
+        let rel_type = format!("{REL_NS}/{rel_kind}");
+        let ref_name = if is_header { "headerReference" } else { "footerReference" };
+        let ref_qname = format!("w:{ref_name}");
+
+        // Replace any existing default reference (and its part).
+        self.remove_header_footer(kind).ok();
+
+        let n = self
+            .pkg
+            .part_names()
+            .filter_map(|p| {
+                p.strip_prefix(&format!("word/{rel_kind}"))
+                    .and_then(|s| s.strip_suffix(".xml"))
+                    .and_then(|x| x.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let part = format!("word/{rel_kind}{n}.xml");
+
+        let mut root = el(root_name, &[("xmlns:w", W_NS), ("xmlns:r", REL_NS)]);
+        let mut p = XmlElement::new("w:p");
+        let mut ppr = XmlElement::new("w:pPr");
+        let align = props.get("align").unwrap_or(if is_header { "left" } else { "center" });
+        let (jc, _) = parse_align(align)?;
+        ppr.push(el("w:jc", &[("w:val", jc)]));
+        p.push(ppr);
+        if let Some(text) = props.get("text") {
+            p.push(build_run(text, props)?);
+        }
+        if props.get_bool("page-numbers")?.unwrap_or(false)
+            || props.get_bool("pagenumbers")?.unwrap_or(false)
+        {
+            let push_literal = |p: &mut XmlElement, text: &str| {
+                let mut r = XmlElement::new("w:r");
+                let mut t = XmlElement::new("w:t");
+                t.set_attr("xml:space", "preserve");
+                t.push_text(text);
+                r.push(t);
+                p.push(r);
+            };
+            if props.has("text") {
+                push_literal(&mut p, " — ");
+            }
+            push_literal(&mut p, "Page ");
+            for run in Self::build_field_runs("PAGE", "1") {
+                p.push(run);
+            }
+            push_literal(&mut p, " of ");
+            for run in Self::build_field_runs("NUMPAGES", "1") {
+                p.push(run);
+            }
+        }
+        root.push(p);
+        self.pkg.put_xml(&part, &root)?;
+        self.pkg.add_override(&part, ct)?;
+        let target = part.strip_prefix("word/").unwrap_or(&part).to_string();
+        let rid = crate::media::add_relationship(&mut self.rels, &rel_type, &target);
+
+        // References go first inside sectPr.
+        let sectpr = self.sectpr_mut()?;
+        let mut reference = el(&ref_qname, &[("w:type", "default")]);
+        reference.set_attr("r:id", &rid);
+        sectpr.children.insert(0, XmlNode::Element(reference));
+
+        let mut info = NodeInfo::new(format!("/{kind}"), kind);
+        info.text = props.get("text").map(|s| s.to_string());
+        Ok(Report::Nodes(vec![info]))
+    }
+
+    /// Remove the default header or footer (reference, rel, and part).
+    fn remove_header_footer(&mut self, kind: &str) -> Result<Report> {
+        let is_header = kind == "header";
+        let ref_name = if is_header { "headerReference" } else { "footerReference" };
+        let rid = self
+            .body()?
+            .child("sectPr")
+            .and_then(|s| {
+                s.children_named(ref_name)
+                    .into_iter()
+                    .find(|r| r.attr_local("type") == Some("default"))
+            })
+            .and_then(|r| r.attr("r:id").or_else(|| r.attr_local("id")))
+            .map(|s| s.to_string())
+            .with_context(|| format!("document has no default {kind}"))?;
+        let target = self
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Id") == Some(rid.as_str()))
+            .and_then(|r| r.attr_local("Target"))
+            .map(|t| format!("word/{}", t.trim_start_matches("./")));
+        if let Some(sectpr) = self.body_mut()?.child_mut("sectPr") {
+            sectpr.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e)
+                    if e.local_name() == ref_name
+                        && e.attr_local("type") == Some("default"))
+            });
+        }
+        self.rels.children.retain(|n| {
+            !matches!(n, XmlNode::Element(e)
+                if e.local_name() == "Relationship" && e.attr_local("Id") == Some(rid.as_str()))
+        });
+        if let Some(part) = target {
+            let mut ct = self.pkg.xml("[Content_Types].xml")?;
+            let part_name = format!("/{part}");
+            ct.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e)
+                    if e.local_name() == "Override"
+                        && e.attr_local("PartName") == Some(&part_name))
+            });
+            self.pkg.put_xml("[Content_Types].xml", &ct)?;
+            self.pkg.remove_part(&part);
+        }
+        Ok(Report::Data {
+            text: format!("removed the default {kind}"),
+            data: json!({ "removed": format!("/{kind}") }),
+        })
+    }
+
     /// Make sure word/settings.xml exists and asks Word to update fields on
     /// open (used by TOC so it populates itself).
     fn ensure_update_fields(&mut self) -> Result<()> {
@@ -1830,7 +2046,7 @@ impl Handler for Docx {
         }
     }
 
-    fn get(&mut self, path_str: &str, depth: usize) -> Result<Report> {
+    fn get(&mut self, path_str: &str, depth: usize, _computed: bool) -> Result<Report> {
         let dpath = path::parse(path_str)?;
         if dpath.is_root()
             || (dpath.segments.len() == 1 && dpath.segments[0].name.eq_ignore_ascii_case("body"))
@@ -1858,6 +2074,7 @@ impl Handler for Docx {
             "footnote" => return self.add_footnote(&parent_indices, props),
             "field" => return self.add_field(&parent_indices, props),
             "list" => return self.add_list(&parent_indices, props, pos),
+            kind @ ("header" | "footer") => return self.add_header_footer(kind, props),
             _ => {}
         }
         if props.has("list") {
@@ -2006,7 +2223,16 @@ impl Handler for Docx {
             bail!("set requires --prop key=value (or --find/--replace)");
         }
         if dpath.is_root() {
-            bail!("set on '/' requires --find/--replace; document-level props are not supported yet");
+            let changed = self.apply_page_setup(props)?;
+            if changed.is_empty() {
+                bail!(
+                    "document-level set supports page setup props: page-size=letter|a4|a3|legal|WxH, orientation=portrait|landscape, margins=1in (or margin-top/right/bottom/left)"
+                );
+            }
+            return Ok(Report::Data {
+                text: format!("set {}", changed.join(", ")),
+                data: json!({ "set": changed }),
+            });
         }
         let indices = self.resolve(&dpath)?;
         let local = self.node_at(&indices)?.local_name().to_string();
@@ -2069,6 +2295,12 @@ impl Handler for Docx {
                 .index()
                 .context("comment removal needs an id, e.g. /comment[1]")? as u32;
             return self.remove_comment(id);
+        }
+        if dpath.segments.len() == 1 {
+            let name = dpath.segments[0].name.to_ascii_lowercase();
+            if name == "header" || name == "footer" {
+                return self.remove_header_footer(&name);
+            }
         }
         let indices = self.resolve(&dpath)?;
         let display = self.display_path(&indices)?;

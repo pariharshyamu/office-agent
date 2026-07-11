@@ -12,11 +12,14 @@ Add --json to any command for structured output ({"ok":true,"data":...}).
 
 COMMANDS
   create <file> [--force]                       Create a blank document
-  view <file> [outline|text|stats|html|screenshot|comments] [-o F]
+  view <file> [outline|text|stats|html|screenshot|comments|notes] [-o F]
                                                 Inspect (screenshot = PNG per
                                                 page/sheet/slide, needs -o)
-  get <file> <path> [--depth N]                 Read an element
+  get <file> <path> [--depth N] [--computed]    Read an element (--computed
+                                                evaluates xlsx formulas)
   query <file> <selector>                       CSS-like element search
+  calc <file> <formula>                         Evaluate a formula (xlsx)
+  diff <file1> <file2>                          Compare two documents
   add <file> <parent> --type T [--prop k=v ...] Add an element
       [--index N | --before PATH | --after PATH]
   set <file> <path> [--prop k=v ...]            Modify properties
@@ -25,10 +28,11 @@ COMMANDS
   swap <file> <path1> <path2>                   Exchange two elements
   copy <file> <path> [--index N]                Duplicate an element (slide,
                                                 sheet, row, paragraph, shape)
+  sort <file> <range> --by COL [--desc]         Sort a cell range (xlsx)
   remove <file> <path>                          Remove an element
   export <file> [--range 'Sheet1!A1:C9'] [-o F] Cell range as CSV (xlsx)
   dump <file>                                   Replayable batch JSON
-  batch <file> [--commands JSON|--input F|stdin] Many ops, one save
+  batch <file> [--commands JSON|--input F|stdin] [--atomic] Many ops, one save
   validate <file>                               Check package structure
   watch <file> [--port N]                       Live-reloading HTML preview
   resident                                      Command loop (line in, JSON out)
@@ -36,6 +40,11 @@ COMMANDS
   help [docx|xlsx|pptx]                         Format-specific guide
 
 Unknown subcommands run `officecli-<name>` plugins found on PATH.
+
+SAFETY (any mutating command)
+  --backup    write <file>.bak before saving
+  --dry-run   perform the operation but do not save
+  batch --atomic   save only if every operation succeeds
 
 QUERY SELECTORS
   paragraph[style=Normal] > run[font!=Arial]    direct-child chain
@@ -104,10 +113,19 @@ ADD
                      or code="..." (parent = a paragraph)
   --type comment     props: text, author; attaches to a paragraph
   --type footnote    props: text; adds superscript reference + note
+  --type header      props: text, align, page-numbers=true, format props;
+  --type footer      added at '/'; replaces any existing default one
 
   Paragraphs also take list=bullet|number|none and level=0-8 directly.
   Word content controls (w:sdt) are transparent: wrapped paragraphs
   address and edit as normal /body/p[N] paths.
+
+PAGE SETUP (set on '/')
+  officecli set doc.docx / --prop orientation=landscape
+  officecli set doc.docx / --prop page-size=a4        # letter/a4/a3/legal/WxH
+  officecli set doc.docx / --prop margins=1in         # or margin-top/-right/...
+
+REMOVE  /header and /footer remove the default header/footer
 
 SET
   paragraph          text (replaces runs), style, align, plus run format
@@ -144,7 +162,24 @@ SET (cells are created on demand)
   format=date|datetime|time|percent|currency|integer|0.00|custom-code
   url=https://...     hyperlink (styled blue + underline)
   bold, italic, underline, color, size, font, fill   cell styling
-  Formulas are stored uncalculated; Excel/LibreOffice recalculate on open.
+  Formulas are stored uncalculated; read results with get --computed or calc.
+
+SET (range / column / row layout)
+  officecli set data.xlsx '/Sheet1/A1:C1' --prop merge=true    # or merge=false
+  officecli set data.xlsx /Sheet1/B --prop width=22            # column width (chars)
+  officecli set data.xlsx '/Sheet1/row[1]' --prop height=28    # row height (points)
+
+FORMULAS (get --computed / calc)
+  ~40 functions: SUM AVERAGE MIN MAX COUNT COUNTA MEDIAN PRODUCT
+  IF IFERROR AND OR NOT  ROUND ROUNDUP ROUNDDOWN INT ABS MOD POWER SQRT
+  EXP LN LOG10  CONCAT LEFT RIGHT MID LEN UPPER LOWER TRIM SUBSTITUTE VALUE
+  SUMIF COUNTIF AVERAGEIF VLOOKUP INDEX MATCH  TODAY NOW DATE YEAR MONTH DAY
+  Cross-sheet refs (Sheet2!A1), ranges, operators + - * / ^ & = <> < > <= >=,
+  cycle detection (#CIRC!). Errors: #DIV/0! #REF! #NAME? #VALUE! #N/A
+
+SORT
+  officecli sort data.xlsx 'Sheet1!A2:C99' --by B [--desc]
+  (numeric-aware; refuses ranges containing formulas)
 
 SET (sheet)
   officecli set data.xlsx /Sheet1 --prop name=Budget    # rename
@@ -205,6 +240,9 @@ ADD
                  values="10,20", series=Name, values2=/series2= for more
                  series, title, x/y/w/h; data is embedded in the chart
                  (PowerPoint renders it; Edit Data needs a linked workbook)
+  --type table   props: data="a,b\nc,d" (CSV-shaped), or rows/cols for an
+                 empty grid; header=true styles the first row; x/y/w/h.
+                 Replace cells later with set --prop data=...
 
 SET
   slide          background=COLOR   notes="speaker notes"

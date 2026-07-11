@@ -872,3 +872,138 @@ fn sdt_content_controls_are_transparent() {
     std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut doc).unwrap();
     assert!(doc.contains("<w:sdt>") && doc.contains("Edited"), "{doc}");
 }
+
+#[test]
+fn formula_evaluation_and_calc() {
+    let dir = temp_dir("formula");
+    ok(&dir, &["create", "d.xlsx"]);
+    for (path, val) in [
+        ("A1", "10"), ("A2", "20"), ("A3", "30"),
+        ("B1", "=SUM(A1:A3)"), ("B2", "=AVERAGE(A1:A3)"),
+        ("B3", "=IF(B1>50,\"big\",\"small\")"),
+        ("B4", "=VLOOKUP(20,A1:A3,1,FALSE)"),
+    ] {
+        ok(&dir, &["set", "d.xlsx", &format!("/Sheet1/{path}"), "--prop", &format!("value={val}")]);
+    }
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/B1", "--computed", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["data"]["results"][0]["text"], "60");
+    assert_eq!(v["data"]["results"][0]["attributes"]["computed"], "true");
+    let out = ok(&dir, &["get", "d.xlsx", "/Sheet1/B3", "--computed"]);
+    assert!(out.contains("\"small\"") || out.contains("small"), "{out}");
+    // Ad-hoc calc against the workbook.
+    let out = ok(&dir, &["calc", "d.xlsx", "=SUM(A1:A3)*2"]);
+    assert_eq!(out.trim(), "120");
+    let out = ok(&dir, &["calc", "d.xlsx", "=1/0"]);
+    assert_eq!(out.trim(), "#DIV/0!");
+}
+
+#[test]
+fn sort_merge_width_height() {
+    let dir = temp_dir("layout");
+    ok(&dir, &["create", "d.xlsx"]);
+    for (path, val) in [
+        ("A1", "Name"), ("B1", "Score"),
+        ("A2", "C"), ("B2", "30"),
+        ("A3", "A"), ("B3", "10"),
+        ("A4", "B"), ("B4", "20"),
+    ] {
+        ok(&dir, &["set", "d.xlsx", &format!("/Sheet1/{path}"), "--prop", &format!("value={val}")]);
+    }
+    ok(&dir, &["sort", "d.xlsx", "Sheet1!A2:B4", "--by", "B", "--desc"]);
+    let json = ok(&dir, &["get", "d.xlsx", "/Sheet1/A2", "--json"]);
+    assert!(json.contains("\"text\": \"C\""), "{json}"); // C (30) first
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A1:B1", "--prop", "merge=true"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A", "--prop", "width=20"]);
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/row[1]", "--prop", "height=30"]);
+    let bytes = std::fs::read(dir.join("d.xlsx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut sheet = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/worksheets/sheet1.xml").unwrap(), &mut sheet).unwrap();
+    assert!(sheet.contains("<mergeCells"), "{sheet}");
+    assert!(sheet.contains("customWidth"), "{sheet}");
+    assert!(sheet.contains("customHeight"), "{sheet}");
+}
+
+#[test]
+fn pptx_tables_roundtrip() {
+    let dir = temp_dir("ptables");
+    ok(&dir, &["create", "t.pptx"]);
+    ok(&dir, &["add", "t.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "t.pptx", "/slide[1]", "--type", "table",
+        "--prop", r"data=Region,Q1\nEast,100\nWest,250",
+    ]);
+    let text = ok(&dir, &["view", "t.pptx", "text"]);
+    assert!(text.contains("Region | Q1"), "{text}");
+    assert!(text.contains("East | 100"), "{text}");
+    ok(&dir, &["set", "t.pptx", "/slide[1]/shape[2]", "--prop", r"data=Region,Q1\nEast,999\nWest,250"]);
+    let text = ok(&dir, &["view", "t.pptx", "text"]);
+    assert!(text.contains("East | 999"), "{text}");
+    let bytes = std::fs::read(dir.join("t.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut slide = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/slide1.xml").unwrap(), &mut slide).unwrap();
+    assert!(slide.contains("<a:tbl>"), "{slide}");
+}
+
+#[test]
+fn docx_headers_footers_page_setup() {
+    let dir = temp_dir("hf");
+    ok(&dir, &["create", "r.docx"]);
+    ok(&dir, &["add", "r.docx", "/body", "--type", "paragraph", "--prop", "text=Body"]);
+    ok(&dir, &["add", "r.docx", "/", "--type", "header", "--prop", "text=CONFIDENTIAL"]);
+    ok(&dir, &["add", "r.docx", "/", "--type", "footer", "--prop", "page-numbers=true"]);
+    ok(&dir, &["set", "r.docx", "/", "--prop", "orientation=landscape", "--prop", "margins=0.75in"]);
+    let bytes = std::fs::read(dir.join("r.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("word/header1.xml").is_ok());
+    assert!(zip.by_name("word/footer1.xml").is_ok());
+    let mut doc = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut doc).unwrap();
+    assert!(doc.contains("w:orient=\"landscape\""), "{doc}");
+    assert!(doc.contains("<w:headerReference"), "{doc}");
+    // Removal drops the reference and part.
+    ok(&dir, &["remove", "r.docx", "/header"]);
+    let bytes = std::fs::read(dir.join("r.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("word/header1.xml").is_err());
+}
+
+#[test]
+fn diff_reports_changes() {
+    let dir = temp_dir("diff");
+    ok(&dir, &["create", "a.docx"]);
+    ok(&dir, &["add", "a.docx", "/body", "--type", "paragraph", "--prop", "text=Original"]);
+    std::fs::copy(dir.join("a.docx"), dir.join("b.docx")).unwrap();
+    ok(&dir, &["set", "b.docx", "/body/p[1]", "--prop", "text=Edited"]);
+    ok(&dir, &["add", "b.docx", "/body", "--type", "paragraph", "--prop", "text=New"]);
+    let out = ok(&dir, &["diff", "a.docx", "b.docx"]);
+    assert!(out.contains("(changed)") && out.contains("from=Original"), "{out}");
+    assert!(out.contains("(added)"), "{out}");
+    let same = ok(&dir, &["diff", "a.docx", "a.docx"]);
+    assert!(same.contains("identical"), "{same}");
+}
+
+#[test]
+fn safety_rails() {
+    let dir = temp_dir("safety");
+    ok(&dir, &["create", "d.docx"]);
+    ok(&dir, &["add", "d.docx", "/body", "--type", "paragraph", "--prop", "text=Keep me"]);
+    // --dry-run does not persist.
+    ok(&dir, &["set", "d.docx", "/body/p[1]", "--prop", "text=Changed", "--dry-run"]);
+    let text = ok(&dir, &["view", "d.docx", "text"]);
+    assert!(text.contains("Keep me") && !text.contains("Changed"), "{text}");
+    // --backup writes a .bak of the pre-change file.
+    ok(&dir, &["set", "d.docx", "/body/p[1]", "--prop", "text=Changed", "--backup"]);
+    assert!(dir.join("d.docx.bak").exists());
+    // --atomic batch: any failure discards everything.
+    ok(&dir, &["create", "e.xlsx"]);
+    let out = run(&dir, &[
+        "batch", "e.xlsx", "--atomic", "--commands",
+        r#"[{"command":"set","path":"/Sheet1/A1","props":{"value":"x"}},{"command":"set","path":"/Nope/A1","props":{"value":"y"}}]"#,
+    ]);
+    assert!(!out.status.success());
+    let a1 = ok(&dir, &["get", "e.xlsx", "/Sheet1/A1", "--json"]);
+    assert!(a1.contains("\"type\": \"empty\""), "atomic batch should have saved nothing: {a1}");
+}

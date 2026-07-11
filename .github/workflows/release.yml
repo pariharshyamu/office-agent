@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v0.2.0)"
+        description: "Release tag to create (e.g. v0.4.0)"
         required: true
-        default: "v0.2.0"
+        default: "v0.4.0"
 
 permissions:
   contents: write
@@ -103,11 +103,17 @@ jobs:
             (.docx), Excel (.xlsx), and PowerPoint (.pptx) files as a single
             static binary — no Microsoft Office, no runtime dependencies.
 
-            **Commands:** create, view (outline/text/stats/html/screenshot),
-            get, query, add (incl. charts, images, comments, footnotes, TOC,
-            pivots), set (props, find/replace, transitions, animations),
-            move, swap, remove, dump, batch, validate, watch (live preview),
-            resident, mcp (Model Context Protocol server), help.
+            **Commands:** create, view (outline/text/stats/html/screenshot/
+            notes), get (--computed), query, calc, diff, add (charts, tables,
+            images, lists, comments, footnotes, TOC, headers/footers, pivots),
+            set (props, find/replace, transitions, animations, page setup,
+            merge/width/height), move, swap, copy, sort, remove, export,
+            dump, batch (--atomic), validate, watch, resident, mcp, help.
+            Mutating commands accept --backup and --dry-run.
+
+            New in this line: a built-in formula evaluator (get --computed /
+            calc), xlsx sort + merged cells + column/row sizing, pptx tables,
+            docx headers/footers + page setup, and a diff command.
 
             **Install (Linux/macOS):**
             ```sh

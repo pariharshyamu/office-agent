@@ -99,10 +99,13 @@ Always quote paths containing brackets (`'/slide[1]'`) — shells glob-expand `[
 
 ```
 create <file> [--force]                          blank .docx/.xlsx/.pptx
-view <file> [outline|text|stats|html|screenshot|comments] [-o FILE]
+view <file> [outline|text|stats|html|screenshot|comments|notes] [-o FILE]
                                                  inspect (screenshot = PNGs)
-get <file> <path> [--depth N] [--json]           read an element
+get <file> <path> [--depth N] [--computed]       read an element (--computed
+                                                 evaluates xlsx formulas)
 query <file> <selector> [--json]                 CSS-like element search
+calc <file> <formula>                            evaluate a formula (xlsx)
+diff <file1> <file2>                             content-level comparison
 add <file> <parent> --type T [--prop k=v ...]    add an element
     [--index N | --before PATH | --after PATH]
 set <file> <path> [--prop k=v ...] [--json]      modify properties
@@ -111,10 +114,11 @@ move <file> <path> [--to P] [--index N|...]      reposition an element
 swap <file> <path1> <path2>                      exchange two elements
 copy <file> <path> [--index N]                   duplicate slide/sheet/row/
                                                  paragraph/table/shape
+sort <file> <range> --by COL [--desc]            sort a cell range (xlsx)
 remove <file> <path> [--json]                    delete an element
 export <file> [--range R] [--sheet S] [-o F]     cell range as CSV (xlsx)
 dump <file>                                      replayable batch JSON
-batch <file> [--commands JSON | --input F]       many ops, one save cycle
+batch <file> [--commands JSON | --input F] [--atomic]   many ops, one save
 validate <file> [--json]                         package sanity check
 watch <file> [--port N]                          live-reloading HTML preview
 resident                                         command loop (line in, JSON line out)
@@ -126,6 +130,10 @@ help [docx|xlsx|pptx]                            agent-oriented guide
 Paths are 1-based; `--index` is 0-based (array convention), except
 `add --type row` on xlsx where `--index` is the 1-based row number
 (matches the OOXML row index, as in upstream OfficeCLI).
+
+Any command that modifies a document accepts `--backup` (write `<file>.bak`
+first) and `--dry-run` (do the work, skip the save) — safety rails for
+autonomous agents.
 
 ### Value formats
 
@@ -187,6 +195,78 @@ officecli add deck.pptx '/slide[1]' --type image \
 PNG, JPEG, and GIF; intrinsic size is read from the file (96 dpi) and the
 aspect ratio is preserved when only one of `w`/`h` is given. Bytes can be
 passed inline with `--prop srcdata=BASE64` (used by `dump` for round-trips).
+
+### Formula evaluation
+
+Formulas are stored uncalculated (Excel recalculates on open), but officecli
+can also **evaluate them itself** so agents close the loop without launching
+Excel:
+
+```bash
+officecli set data.xlsx /Sheet1/C1 --prop value="=SUM(B2:B99)"
+officecli get data.xlsx /Sheet1/C1 --computed      # → text is the result
+officecli calc data.xlsx '=VLOOKUP("West",A2:C99,3,FALSE)'
+officecli calc data.xlsx '=AVERAGE(Sheet2!B:B)*1.2'
+```
+
+~40 functions are supported (SUM/AVERAGE/MIN/MAX/COUNT/MEDIAN, IF/IFERROR/
+AND/OR/NOT, ROUND family, ABS/MOD/POWER/SQRT/EXP/LN/LOG10, CONCAT/LEFT/RIGHT/
+MID/LEN/UPPER/LOWER/TRIM/SUBSTITUTE/VALUE, SUMIF/COUNTIF/AVERAGEIF, VLOOKUP/
+INDEX/MATCH, TODAY/NOW/DATE/YEAR/MONTH/DAY) with cross-sheet references,
+ranges, the full operator set, and cycle detection (`#CIRC!`). Unsupported
+functions and bad references return Excel-style error values (`#NAME?`,
+`#DIV/0!`, `#REF!`, `#N/A`) rather than failing the command.
+
+### Sort, merge, column width, row height (xlsx)
+
+```bash
+officecli sort data.xlsx 'Sheet1!A2:C99' --by B --desc   # numeric-aware
+officecli set data.xlsx '/Sheet1/A1:C1' --prop merge=true
+officecli set data.xlsx /Sheet1/B --prop width=22        # characters
+officecli set data.xlsx '/Sheet1/row[1]' --prop height=28  # points
+```
+
+`sort` refuses ranges containing formulas (rearranging values would silently
+break them). `merge=false` unmerges.
+
+### Tables (pptx)
+
+```bash
+officecli add deck.pptx '/slide[1]' --type table \
+    --prop data='Region,Q1,Q2\nEast,100,120\nWest,250,300' --prop w=9in
+officecli set deck.pptx '/slide[1]/shape[2]' --prop data='Region,Q1,Q2\nEast,999,...'
+```
+
+A real `a:tbl` graphicFrame (python-pptx sees `shape.has_table`), styled
+header row, cells editable later via `set --prop data=`, and rendered as a
+grid in screenshots.
+
+### Headers, footers, page setup (docx)
+
+```bash
+officecli add report.docx / --type header --prop text="CONFIDENTIAL"
+officecli add report.docx / --type footer --prop page-numbers=true
+officecli set report.docx / --prop orientation=landscape --prop margins=0.75in
+officecli set report.docx / --prop page-size=a4
+officecli remove report.docx /header
+```
+
+`page-numbers=true` inserts live `PAGE`/`NUMPAGES` fields. Page size accepts
+`letter`/`a4`/`a3`/`legal` or `WxH` (e.g. `8.5inx11in`); margins accept a
+uniform value or per-side `margin-top`/`-right`/`-bottom`/`-left`.
+
+### diff
+
+```bash
+officecli diff before.docx after.docx
+# /body/p[1] (changed) "Hello there" from=Hello world
+# /body/p[3] (added) paragraph "Third line"
+# 3 change(s)
+```
+
+Content-level comparison of two same-format documents (added/removed/changed
+nodes with paths and attribute deltas) — built for agent verify loops. Prints
+"documents are identical" when there are no differences.
 
 ### Lists
 
@@ -408,29 +488,36 @@ failure.
 runs (bold/italic/underline/size/color/font/highlight), bulleted/numbered
 lists with nesting, hyperlinks, tables (create, add row, set cell text +
 formatting), page breaks, images, comments (add/list/remove), footnotes,
-TOC and fields, copy, transparent `w:sdt` content controls, insert
+TOC and fields, headers/footers with page numbers, page setup (orientation/
+size/margins), copy, transparent `w:sdt` content controls, insert
 before/after/at index, whole-scope find/replace and find+format with run
 splitting, outline/text/stats/html/comments/screenshot views.
 
 **Excel (.xlsx)** — cells created on demand via `set` (strings, numbers,
-booleans, real dates/times, formulas auto-detected by `=`), number formats
-(percent/currency/custom codes), hyperlinks, CSV import/export,
-shared-string-aware reads, cell styling (bold/italic/underline/color/size/
-font/fill) through a styles-table manager, sheets (add/rename/remove/copy),
-rows and columns (insert/remove/copy with shifts and workbook-wide
-formula-reference rewriting), charts over live ranges, computed pivot
-summaries, ranges on `get`, `$Sheet:A1` addressing, find/replace over
-string cells, grid/outline/stats/html/screenshot views. Formulas are stored
-uncalculated with `fullCalcOnLoad` so Excel/LibreOffice recalculate on open.
+booleans, real dates/times, formulas auto-detected by `=`), a built-in
+formula evaluator (~40 functions, `get --computed`/`calc`), number formats
+(percent/currency/custom codes), hyperlinks, CSV import/export, sort, merged
+cells, column widths and row heights, shared-string-aware reads, cell
+styling (bold/italic/underline/color/size/font/fill) through a styles-table
+manager, sheets (add/rename/remove/copy), rows and columns (insert/remove/
+copy with shifts and workbook-wide formula-reference rewriting), charts over
+live ranges, computed pivot summaries, ranges on `get`, `$Sheet:A1`
+addressing, find/replace over string cells, grid/outline/stats/html/
+screenshot views. Formulas are stored uncalculated with `fullCalcOnLoad` so
+Excel/LibreOffice recalculate on open.
 
 **PowerPoint (.pptx)** — slides (add with `title`/`background`/`notes`,
 position with `--index/--before/--after`, copy with notes, remove with full
 relationship cleanup), textbox shapes (text, x/y/w/h in any length unit,
 size/color/bold/italic/font/align/fill/name/url, bullet/numbered lists with
-levels), speaker notes, images, charts, slide transitions, entrance
-animations, theme-color resolution (schemeClr + lumMod/lumOff), shape
-addressing by position, `@name=`, or `@id=`, slide background, find/replace
-across slides, outline/text/stats/html/notes/screenshot views.
+levels), tables (CSV-shaped data, styled header, editable cells), speaker
+notes, images, charts, slide transitions, entrance animations, theme-color
+resolution (schemeClr + lumMod/lumOff), shape addressing by position,
+`@name=`, or `@id=`, slide background, find/replace across slides,
+outline/text/stats/html/notes/screenshot views.
+
+Every mutating command supports `--backup`, `--dry-run`, and (for `batch`)
+`--atomic`. `diff` compares two documents content-wise for verify loops.
 
 Blank documents created by `create` open without repair prompts in Word,
 Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
@@ -441,17 +528,18 @@ Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
 This is a focused port, not a feature-complete clone. Honest edges of the
 implemented features: `view screenshot` is an approximation (PNG images
 composite; JPEG/GIF and charts render as placeholders; no italics or
-justified text); pivots are computed summary tables, not native interactive
-PivotTables; pptx charts embed cached data without a linked workbook, so
-PowerPoint's "Edit Data" won't open a sheet; animations cover click-triggered
-entrance effects only; theme-color transforms (lumMod/lumOff/tint/shade) are
-per-channel approximations of Office's HSL math; formula evaluation is not
-performed (values compute on open); `dump` is a high-fidelity content
+justified text); the formula evaluator covers ~40 common functions but not
+the full Excel library, and dates compute against the 1900 date system only;
+pivots are computed summary tables, not native interactive PivotTables; pptx
+charts embed cached data without a linked workbook, so PowerPoint's "Edit
+Data" won't open a sheet; animations cover click-triggered entrance effects
+only; theme-color transforms (lumMod/lumOff/tint/shade) are per-channel
+approximations of Office's HSL math; `dump` is a high-fidelity content
 replay, not a byte-identical round-trip. Not implemented: scatter charts,
-docx charts, xlsx cell comments, headers/footers, formula evaluation, and
-PowerPoint motion-path animations. The architecture (lossless XML DOM over
-the zip package, one handler per format behind a common trait) is designed
-so these can be added incrementally.
+docx charts, xlsx cell comments, array formulas, and PowerPoint motion-path
+animations. The architecture (lossless XML DOM over the zip package, one
+handler per format behind a common trait) is designed so these can be added
+incrementally.
 
 ## Architecture
 
@@ -469,16 +557,18 @@ src/
   html.rs       escaping + page shell for `view html`
   render.rs     PNG canvas (tiny-skia + ab_glyph + embedded DejaVu Sans)
   chart.rs      DrawingML chartSpace builder (xlsx + pptx charts)
+  formula.rs    spreadsheet formula tokenizer / parser / evaluator
+  diff.rs       content-level document comparison (NodeInfo trees)
   mcp.rs        Model Context Protocol server (stdio JSON-RPC)
   resident.rs   long-lived command loop (line in, JSON line out)
   watch.rs      live-preview HTTP server (std-only, mtime polling)
   templates.rs  minimal valid blank .docx/.xlsx/.pptx packages
   docx.rs       Word handler (incl. cross-run find/replace + run splitting,
-                comments/footnotes/TOC/fields, page renderer)
+                comments/footnotes/TOC/fields, headers/footers, page setup)
   xlsx.rs       Excel handler (incl. shared strings, styles manager,
-                row/column shifts with formula-reference rewriting,
-                charts, pivot summaries, grid renderer)
-  pptx.rs       PowerPoint handler (slides/shapes/images/charts/
+                row/column shifts with formula-reference rewriting, formula
+                evaluation, sort/merge/layout, charts, pivots, grid renderer)
+  pptx.rs       PowerPoint handler (slides/shapes/images/charts/tables/
                 transitions/animations, slide renderer)
   batch.rs      JSON batch runner
   helptext.rs   `officecli help` agent guide

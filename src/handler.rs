@@ -22,7 +22,8 @@ pub enum Position {
 
 pub trait Handler {
     fn view(&mut self, mode: &str) -> Result<Report>;
-    fn get(&mut self, path: &str, depth: usize) -> Result<Report>;
+    /// `computed` asks for formula results (xlsx) instead of stored values.
+    fn get(&mut self, path: &str, depth: usize, computed: bool) -> Result<Report>;
     fn add(&mut self, parent: &str, typ: &str, props: &Props, pos: &Position) -> Result<Report>;
     fn set(
         &mut self,
@@ -70,5 +71,17 @@ pub trait Handler {
     fn copy_el(&mut self, path: &str, pos: &Position) -> Result<Report> {
         let _ = (path, pos);
         anyhow::bail!("copy is not supported for this format")
+    }
+
+    /// Evaluate an ad-hoc spreadsheet formula (xlsx only).
+    fn calc(&mut self, expr: &str) -> Result<Report> {
+        let _ = expr;
+        anyhow::bail!("calc is only supported for xlsx")
+    }
+
+    /// Sort a cell range in place (xlsx only).
+    fn sort(&mut self, range: &str, by: &str, descending: bool) -> Result<Report> {
+        let _ = (range, by, descending);
+        anyhow::bail!("sort is only supported for xlsx")
     }
 }

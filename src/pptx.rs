@@ -297,7 +297,7 @@ impl Pptx {
         if !text.is_empty() {
             info.text = Some(text);
         }
-        if let Some(xfrm) = e.child("spPr").and_then(|sp| sp.child("xfrm")) {
+        if let Some(xfrm) = shape_xfrm(e) {
             if let Some(off) = xfrm.child("off") {
                 if let (Some(x), Some(y)) = (off.attr_local("x"), off.attr_local("y")) {
                     info.attr("x", x);
@@ -696,6 +696,143 @@ impl Pptx {
         };
         self.pkg.put_xml(&part, &build_notes_xml(text))?;
         Ok(())
+    }
+
+    /// Insert a table as a graphicFrame with an a:tbl.
+    fn add_table(&mut self, slide_idx: usize, props: &Props) -> Result<Report> {
+        let data: Vec<Vec<String>> = props
+            .get("data")
+            .map(|d| crate::xlsx::parse_csv(&d.replace("\\n", "\n")))
+            .unwrap_or_default();
+        let rows: usize = props
+            .get("rows")
+            .map(|v| v.parse())
+            .transpose()
+            .context("rows must be a number")?
+            .unwrap_or_else(|| data.len().max(2));
+        let cols: usize = props
+            .get("cols")
+            .map(|v| v.parse())
+            .transpose()
+            .context("cols must be a number")?
+            .unwrap_or_else(|| data.iter().map(|r| r.len()).max().unwrap_or(2));
+        if rows == 0 || cols == 0 || rows > 500 || cols > 50 {
+            bail!("table size {rows}x{cols} out of range");
+        }
+        let header = props.get_bool("header")?.unwrap_or(true);
+        let x = props.get("x").map(parse_emu).transpose()?.unwrap_or(914_400);
+        let y = props.get("y").map(parse_emu).transpose()?.unwrap_or(1_600_200);
+        let w = props
+            .get("w")
+            .or_else(|| props.get("width"))
+            .map(parse_emu)
+            .transpose()?
+            .unwrap_or(7_315_200);
+        let h = props
+            .get("h")
+            .or_else(|| props.get("height"))
+            .map(parse_emu)
+            .transpose()?
+            .unwrap_or((rows as i64) * 370_840);
+
+        let mut tbl = XmlElement::new("a:tbl");
+        let mut tblpr = el("a:tblPr", &[("bandRow", "1")]);
+        if header {
+            tblpr.set_attr("firstRow", "1");
+        }
+        tbl.push(tblpr);
+        let mut grid = XmlElement::new("a:tblGrid");
+        let col_w = (w / cols as i64).to_string();
+        for _ in 0..cols {
+            grid.push(el("a:gridCol", &[("w", col_w.as_str())]));
+        }
+        tbl.push(grid);
+        let row_h = (h / rows as i64).to_string();
+        for r in 0..rows {
+            let mut tr = el("a:tr", &[("h", row_h.as_str())]);
+            for c in 0..cols {
+                let text = data
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .cloned()
+                    .unwrap_or_default();
+                let is_header = header && r == 0;
+                let mut tc = XmlElement::new("a:tc");
+                let mut tx = XmlElement::new("a:txBody");
+                tx.push(XmlElement::new("a:bodyPr"));
+                tx.push(XmlElement::new("a:lstStyle"));
+                let mut p = XmlElement::new("a:p");
+                let mut run = XmlElement::new("a:r");
+                let mut rpr = el("a:rPr", &[("lang", "en-US")]);
+                if is_header {
+                    rpr.set_attr("b", "1");
+                    rpr.push(solid_fill("FFFFFF"));
+                }
+                run.push(rpr);
+                let mut t = XmlElement::new("a:t");
+                t.push_text(&text);
+                run.push(t);
+                p.push(run);
+                tx.push(p);
+                tc.push(tx);
+                let mut tcpr = XmlElement::new("a:tcPr");
+                for side in ["a:lnL", "a:lnR", "a:lnT", "a:lnB"] {
+                    let mut ln = el(side, &[("w", "12700")]);
+                    ln.push(solid_fill("999999"));
+                    tcpr.push(ln);
+                }
+                if is_header {
+                    tcpr.push(solid_fill("4472C4"));
+                }
+                tc.push(tcpr);
+                tr.push(tc);
+            }
+            tbl.push(tr);
+        }
+
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let id = Self::next_shape_id(tree);
+        let name = props
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Table {id}"));
+        let mut frame = XmlElement::new("p:graphicFrame");
+        let mut nv = XmlElement::new("p:nvGraphicFramePr");
+        nv.push(el(
+            "p:cNvPr",
+            &[("id", id.to_string().as_str()), ("name", name.as_str())],
+        ));
+        nv.push(XmlElement::new("p:cNvGraphicFramePr"));
+        nv.push(XmlElement::new("p:nvPr"));
+        frame.push(nv);
+        let mut xfrm = XmlElement::new("p:xfrm");
+        xfrm.push(el(
+            "a:off",
+            &[("x", x.to_string().as_str()), ("y", y.to_string().as_str())],
+        ));
+        xfrm.push(el(
+            "a:ext",
+            &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+        ));
+        frame.push(xfrm);
+        let mut graphic = XmlElement::new("a:graphic");
+        let mut gdata = el(
+            "a:graphicData",
+            &[("uri", "http://schemas.openxmlformats.org/drawingml/2006/table")],
+        );
+        gdata.push(tbl);
+        graphic.push(gdata);
+        frame.push(graphic);
+
+        let tree = Self::sp_tree_mut(&mut self.slides[slide_idx])?;
+        tree.push(frame);
+        let tree = Self::sp_tree(&self.slides[slide_idx])?;
+        let shape_idxs = Self::shape_indices(tree);
+        let e = tree.children[*shape_idxs.last().unwrap()].as_element().unwrap();
+        let spath = format!("/slide[{}]/shape[{}]", slide_idx + 1, shape_idxs.len());
+        let mut info = self.shape_info(e, &spath);
+        info.attr("table", format!("{rows}x{cols}"));
+        Ok(Report::Nodes(vec![info]))
     }
 
     /// Insert a chart as a graphicFrame. Data comes from props
@@ -1148,6 +1285,14 @@ fn shape_cnvpr(e: &XmlElement) -> Option<&XmlElement> {
         .and_then(|nv| nv.child("cNvPr"))
 }
 
+
+/// Shape geometry: sp/pic keep xfrm under spPr, graphicFrames directly.
+fn shape_xfrm(e: &XmlElement) -> Option<&XmlElement> {
+    e.child("spPr")
+        .and_then(|sp| sp.child("xfrm"))
+        .or_else(|| e.child("xfrm"))
+}
+
 fn shape_kind(e: &XmlElement) -> &'static str {
     match e.local_name() {
         "sp" => "shape",
@@ -1159,8 +1304,70 @@ fn shape_kind(e: &XmlElement) -> &'static str {
     }
 }
 
-/// All text in a shape's txBody, paragraphs joined with '\n'.
+/// The a:tbl inside a graphicFrame, if it holds a table.
+fn frame_table(e: &XmlElement) -> Option<&XmlElement> {
+    e.child("graphic")?.child("graphicData")?.child("tbl")
+}
+
+fn frame_table_mut(e: &mut XmlElement) -> Option<&mut XmlElement> {
+    e.child_mut("graphic")?
+        .child_mut("graphicData")?
+        .child_mut("tbl")
+}
+
+/// Replace every cell text in a table from CSV-shaped data.
+fn set_table_data(tbl: &mut XmlElement, data: &str) -> (usize, usize) {
+    let grid = crate::xlsx::parse_csv(&data.replace("\\n", "\n"));
+    let mut rows = 0;
+    let mut cols = 0;
+    let mut r = 0;
+    for node in tbl.children.iter_mut().filter_map(|n| n.as_element_mut()) {
+        if node.local_name() != "tr" {
+            continue;
+        }
+        let mut c = 0;
+        for tc in node.children.iter_mut().filter_map(|n| n.as_element_mut()) {
+            if tc.local_name() != "tc" {
+                continue;
+            }
+            let text = grid
+                .get(r)
+                .and_then(|row| row.get(c))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(t) = tc
+                .child_mut("txBody")
+                .and_then(|tx| tx.child_mut("p"))
+                .and_then(|p| p.child_mut("r"))
+                .and_then(|run| run.child_mut("t"))
+            {
+                t.children.clear();
+                t.push_text(&text);
+            }
+            c += 1;
+        }
+        cols = cols.max(c);
+        r += 1;
+        rows = r;
+    }
+    (rows, cols)
+}
+
+/// All text in a shape's txBody, paragraphs joined with '\n'. Tables render
+/// as one line per row with cells joined by ' | '.
 fn shape_text(e: &XmlElement) -> String {
+    if let Some(tbl) = frame_table(e) {
+        let mut lines = Vec::new();
+        for tr in tbl.children_named("tr") {
+            let cells: Vec<String> = tr
+                .children_named("tc")
+                .iter()
+                .map(|tc| tc.text_content())
+                .collect();
+            lines.push(cells.join(" | "));
+        }
+        return lines.join("\n");
+    }
     let Some(tx) = e.child("txBody") else {
         return String::new();
     };
@@ -1514,7 +1721,7 @@ impl Handler for Pptx {
         }
     }
 
-    fn get(&mut self, path_str: &str, depth: usize) -> Result<Report> {
+    fn get(&mut self, path_str: &str, depth: usize, _computed: bool) -> Result<Report> {
         let dpath = path::parse(path_str)?;
         if dpath.is_root() {
             let mut info = NodeInfo::new("/", "presentation");
@@ -1680,6 +1887,13 @@ impl Handler for Pptx {
                 }
                 let slide_idx = self.slide_index(&dpath.segments[0])?;
                 self.add_chart(slide_idx, props)
+            }
+            "table" | "tbl" => {
+                if dpath.segments.is_empty() {
+                    bail!("tables are added to a slide: officecli add file.pptx '/slide[1]' --type table --prop data=\"a,b\\nc,d\"");
+                }
+                let slide_idx = self.slide_index(&dpath.segments[0])?;
+                self.add_table(slide_idx, props)
             }
             other => bail!("unsupported pptx element type '{other}' (slide/shape/image/chart)"),
         }
@@ -1848,6 +2062,17 @@ impl Handler for Pptx {
                         break;
                     }
                 }
+            }
+        }
+
+        // Table data replacement.
+        if let Some(data) = props.get("data") {
+            match frame_table_mut(sp) {
+                Some(tbl) => {
+                    let (rows, cols) = set_table_data(tbl, data);
+                    let _ = (rows, cols);
+                }
+                None => bail!("--prop data= applies to table shapes"),
             }
         }
 
@@ -2289,7 +2514,7 @@ impl Handler for Pptx {
             let tree = Self::sp_tree(slide)?;
             for &si in &Self::shape_indices(tree) {
                 let e = tree.children[si].as_element().unwrap();
-                let xfrm = e.child("spPr").and_then(|sp| sp.child("xfrm"));
+                let xfrm = shape_xfrm(e);
                 let emu = |el: Option<&XmlElement>, a: &str| -> f32 {
                     el.and_then(|e| e.attr_local(a))
                         .and_then(|v| v.parse::<f64>().ok())
@@ -2320,8 +2545,50 @@ impl Handler for Pptx {
                         canvas.draw_image(&bytes, x, y, w.max(2.0), h.max(2.0));
                     }
                     "graphicFrame" => {
-                        canvas.stroke_rect(x, y, w, h, MUTED);
-                        canvas.draw_text("[chart]", x + 8.0, y + 20.0, 14.0, MUTED, false);
+                        if let Some(tbl) = frame_table(e) {
+                            let trs = tbl.children_named("tr");
+                            let rows = trs.len().max(1);
+                            let cols = trs
+                                .first()
+                                .map(|tr| tr.children_named("tc").len())
+                                .unwrap_or(1)
+                                .max(1);
+                            let (cw, rh) = (w / cols as f32, h / rows as f32);
+                            let font = (rh * 0.45).min(16.0);
+                            for (r, tr) in trs.iter().enumerate() {
+                                for (c, tc) in tr.children_named("tc").iter().enumerate() {
+                                    let (cx, cy) = (x + cw * c as f32, y + rh * r as f32);
+                                    let fill = tc
+                                        .child("tcPr")
+                                        .and_then(|p| resolve_fill_color(p, &self.theme))
+                                        .and_then(|hex| Color::from_hex(&hex));
+                                    if let Some(fill) = fill {
+                                        canvas.fill_rect(cx, cy, cw, rh, fill);
+                                    }
+                                    canvas.stroke_rect(cx, cy, cw, rh, MUTED);
+                                    let text = tc.text_content();
+                                    let color = tc
+                                        .child("txBody")
+                                        .and_then(|tx| tx.child("p"))
+                                        .and_then(|p| p.child("r"))
+                                        .and_then(|run| run.child("rPr"))
+                                        .and_then(|rpr| resolve_fill_color(rpr, &self.theme))
+                                        .and_then(|hex| Color::from_hex(&hex))
+                                        .unwrap_or(default_text);
+                                    canvas.draw_text(
+                                        &text,
+                                        cx + 6.0,
+                                        cy + rh / 2.0 + font / 3.0,
+                                        font,
+                                        color,
+                                        false,
+                                    );
+                                }
+                            }
+                        } else {
+                            canvas.stroke_rect(x, y, w, h, MUTED);
+                            canvas.draw_text("[chart]", x + 8.0, y + 20.0, 14.0, MUTED, false);
+                        }
                     }
                     _ => {
                         let Some(tx) = e.child("txBody") else { continue };
@@ -2609,7 +2876,7 @@ fn render_shape_html(
     theme: &std::collections::HashMap<String, String>,
     out: &mut String,
 ) {
-    let xfrm = e.child("spPr").and_then(|sp| sp.child("xfrm"));
+    let xfrm = shape_xfrm(e);
     let get = |el: Option<&XmlElement>, a: &str| -> f64 {
         el.and_then(|e| e.attr_local(a))
             .and_then(|v| v.parse::<f64>().ok())

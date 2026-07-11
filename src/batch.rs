@@ -147,6 +147,7 @@ fn run_item(handler: &mut dyn Handler, item: &BatchItem) -> Result<Report> {
         "get" => handler.get(
             item.path.as_deref().context("get needs 'path'")?,
             item.depth.unwrap_or(0),
+            false,
         ),
         "view" => handler.view(item.mode.as_deref().unwrap_or("outline")),
         "add" => handler.add(
