@@ -1243,12 +1243,66 @@ fn motion_anim(spid: &str, attr_name: &str, from: &str, to: &str, duration_ms: u
     anim
 }
 
-/// Append one click-triggered entrance effect for shape `spid`.
+/// `p:animMotion` moving a shape along a relative path (fractions of the
+/// slide size, origin at the shape's own position).
+fn motion_path_behavior(spid: &str, path: &str, duration_ms: u64) -> XmlElement {
+    let mut anim = el(
+        "p:animMotion",
+        &[
+            ("origin", "layout"),
+            ("path", path),
+            ("pathEditMode", "relative"),
+        ],
+    );
+    let mut cbhvr = XmlElement::new("p:cBhvr");
+    cbhvr.push(el(
+        "p:cTn",
+        &[("id", "0"), ("dur", duration_ms.to_string().as_str()), ("fill", "hold")],
+    ));
+    cbhvr.push(sp_target(spid));
+    let mut attrs = XmlElement::new("p:attrNameLst");
+    for name in ["ppt_x", "ppt_y"] {
+        let mut a = XmlElement::new("p:attrName");
+        a.push_text(name);
+        attrs.push(a);
+    }
+    cbhvr.push(attrs);
+    anim.push(cbhvr);
+    anim
+}
+
+/// Turn `path=` input into a VML-style motion path: raw `M ... E` strings
+/// pass through; `dx,dy dx,dy ...` waypoint pairs (slide-size fractions)
+/// become `M 0 0 L dx dy ... E`.
+fn build_motion_path(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.to_ascii_uppercase().starts_with('M') {
+        return Ok(raw.to_string());
+    }
+    let mut path = String::from("M 0 0");
+    for pair in raw.split_whitespace() {
+        let (x, y) = pair
+            .split_once(',')
+            .with_context(|| format!("'{pair}' is not an x,y waypoint (e.g. 0.25,0.1)"))?;
+        let x: f64 = x.trim().parse().with_context(|| format!("'{x}' is not a number"))?;
+        let y: f64 = y.trim().parse().with_context(|| format!("'{y}' is not a number"))?;
+        path.push_str(&format!(" L {x} {y}"));
+    }
+    if path == "M 0 0" {
+        bail!("path needs at least one x,y waypoint (fractions of the slide size)");
+    }
+    path.push_str(" E");
+    Ok(path)
+}
+
+/// Append one click-triggered effect for shape `spid` (entrance effects
+/// and motion paths share the timing-tree scaffolding).
 fn append_entrance_animation(
     slide_xml: &mut XmlElement,
     spid: &str,
     effect: &str,
     direction: &str,
+    path: Option<&str>,
     duration_ms: u64,
     delay_ms: u64,
 ) -> Result<()> {
@@ -1256,12 +1310,23 @@ fn append_entrance_animation(
     // fly-in uses motion behaviors instead of a filter.
     let effect_lc = effect.to_ascii_lowercase();
     let fly_in = matches!(effect_lc.as_str(), "fly-in" | "flyin" | "fly");
+    let motion = matches!(effect_lc.as_str(), "motion-path" | "motion" | "path");
     let (preset_id, filter): (u32, Option<String>) = match effect_lc.as_str() {
         "appear" => (1, None),
         "fade" | "fade-in" | "fadein" => (10, Some("fade".to_string())),
         "wipe" | "wipe-in" => (22, Some("wipe(bottom)".to_string())),
         "fly-in" | "flyin" | "fly" => (2, None),
-        other => bail!("unknown animation '{other}' (appear/fade/wipe/fly-in)"),
+        // Custom motion path (presetClass="path", presetID 0).
+        "motion-path" | "motion" | "path" => (0, None),
+        other => bail!("unknown animation '{other}' (appear/fade/wipe/fly-in/motion-path)"),
+    };
+    let motion_path = if motion {
+        let raw = path.context(
+            "motion-path needs --prop path=\"0.25,0.1 0.5,0\" (slide-size fractions) or a raw \"M 0 0 L ... E\" string",
+        )?;
+        Some(build_motion_path(raw)?)
+    } else {
+        None
     };
     // Fly-in start position and PowerPoint's UI subtype code per direction.
     let (preset_subtype, fly_from): (u32, (&str, &str)) =
@@ -1285,27 +1350,33 @@ fn append_entrance_animation(
         v.to_string()
     };
 
-    // Effect behaviors.
+    // Effect behaviors. Entrance effects reveal the shape; motion paths
+    // leave visibility alone.
     let mut behaviors: Vec<XmlElement> = Vec::new();
-    let mut set = XmlElement::new("p:set");
-    let mut cbhvr = XmlElement::new("p:cBhvr");
-    let mut ctn = el("p:cTn", &[("id", "0"), ("dur", "1"), ("fill", "hold")]);
-    let mut st = XmlElement::new("p:stCondLst");
-    st.push(cond("0"));
-    ctn.push(st);
-    cbhvr.push(ctn);
-    cbhvr.push(sp_target(spid));
-    let mut attrs = XmlElement::new("p:attrNameLst");
-    let mut attr = XmlElement::new("p:attrName");
-    attr.push_text("style.visibility");
-    attrs.push(attr);
-    cbhvr.push(attrs);
-    set.push(cbhvr);
-    let mut to = XmlElement::new("p:to");
-    let mut sv = el("p:strVal", &[("val", "visible")]);
-    to.push(std::mem::take(&mut sv));
-    set.push(to);
-    behaviors.push(set);
+    if !motion {
+        let mut set = XmlElement::new("p:set");
+        let mut cbhvr = XmlElement::new("p:cBhvr");
+        let mut ctn = el("p:cTn", &[("id", "0"), ("dur", "1"), ("fill", "hold")]);
+        let mut st = XmlElement::new("p:stCondLst");
+        st.push(cond("0"));
+        ctn.push(st);
+        cbhvr.push(ctn);
+        cbhvr.push(sp_target(spid));
+        let mut attrs = XmlElement::new("p:attrNameLst");
+        let mut attr = XmlElement::new("p:attrName");
+        attr.push_text("style.visibility");
+        attrs.push(attr);
+        cbhvr.push(attrs);
+        set.push(cbhvr);
+        let mut to = XmlElement::new("p:to");
+        let mut sv = el("p:strVal", &[("val", "visible")]);
+        to.push(std::mem::take(&mut sv));
+        set.push(to);
+        behaviors.push(set);
+    }
+    if let Some(mp) = &motion_path {
+        behaviors.push(motion_path_behavior(spid, mp, duration_ms));
+    }
     if let Some(filter) = &filter {
         let mut anim = el(
             "p:animEffect",
@@ -1329,7 +1400,7 @@ fn append_entrance_animation(
         &[
             ("id", "0"),
             ("presetID", preset_id.to_string().as_str()),
-            ("presetClass", "entr"),
+            ("presetClass", if motion { "path" } else { "entr" }),
             ("presetSubtype", preset_subtype.to_string().as_str()),
             ("fill", "hold"),
             ("nodeType", "clickEffect"),
@@ -2091,11 +2162,13 @@ impl Handler for Pptx {
                 .unwrap_or(500);
             let delay = props.get("delay").map(parse_duration_ms).transpose()?.unwrap_or(0);
             let direction = props.get("direction").unwrap_or("bottom").to_string();
+            let path = props.get("path").map(|s| s.to_string());
             append_entrance_animation(
                 &mut self.slides[slide_idx].xml,
                 &spid,
                 effect,
                 &direction,
+                path.as_deref(),
                 duration,
                 delay,
             )?;
@@ -2763,7 +2836,9 @@ impl Handler for Pptx {
                             let max_size = spans.iter().map(|s| s.size).fold(12.0f32, f32::max);
                             let line_h = max_size * 1.25;
                             let usable = (w - 2.0 * pad - extra_indent).max(20.0);
-                            for line in canvas.layout_spans(&spans, usable) {
+                            let lines = canvas.layout_spans(&spans, usable);
+                            let last_line = lines.len().saturating_sub(1);
+                            for (li, line) in lines.into_iter().enumerate() {
                                 let lw = canvas.spans_width(&line);
                                 let lx = match algn {
                                     "ctr" => x + pad + (usable - lw) / 2.0,
@@ -2771,7 +2846,17 @@ impl Handler for Pptx {
                                     _ => x + pad,
                                 } + extra_indent;
                                 let asc = canvas.ascent(max_size, false);
-                                canvas.draw_spans_line(&line, lx, top + pad + asc);
+                                // algn=just stretches all but the last line.
+                                if algn == "just" && li < last_line {
+                                    canvas.draw_spans_justified(
+                                        &line,
+                                        lx,
+                                        top + pad + asc,
+                                        usable - extra_indent,
+                                    );
+                                } else {
+                                    canvas.draw_spans_line(&line, lx, top + pad + asc);
+                                }
                                 top += line_h;
                             }
                         }

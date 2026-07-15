@@ -1201,3 +1201,121 @@ fn formula_v05_functions() {
     let out = ok(&dir, &["calc", "f.xlsx", "=CEILING(A2+0.1,0.5)"]);
     assert!(out.contains("3.5"), "{out}");
 }
+
+#[test]
+fn array_formulas_broadcast_and_store() {
+    let dir = temp_dir("v06array");
+    ok(&dir, &["create", "a.xlsx"]);
+    ok(&dir, &["add", "a.xlsx", "/Sheet1", "--type", "row", "--prop", "values=2,10"]);
+    ok(&dir, &["add", "a.xlsx", "/Sheet1", "--type", "row", "--prop", "values=3,20"]);
+    ok(&dir, &["add", "a.xlsx", "/Sheet1", "--type", "row", "--prop", "values=4,30"]);
+    // Elementwise broadcasting in calc.
+    let out = ok(&dir, &["calc", "a.xlsx", "=SUM(A1:A3*B1:B3)"]);
+    assert!(out.trim().ends_with("200"), "{out}");
+    let out = ok(&dir, &["calc", "a.xlsx", "=SUM((A1:A3>2)*B1:B3)"]);
+    assert!(out.trim().ends_with("50"), "{out}");
+    // {=...} stores a t="array" formula that evaluates on read.
+    ok(&dir, &["set", "a.xlsx", "/Sheet1/C1", "--prop", "value={=SUM(A1:A3*B1:B3)}"]);
+    let sheet = zip_text(&dir.join("a.xlsx"), "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(r#"<f t="array" ref="C1""#), "{sheet}");
+    let got = ok(&dir, &["get", "a.xlsx", "/Sheet1/C1", "--computed"]);
+    assert!(got.contains("\"200\"") && got.contains("{=SUM"), "{got}");
+    // Mismatched shapes error instead of guessing.
+    let out = ok(&dir, &["calc", "a.xlsx", "=SUM(A1:A2*B1:B3)"]);
+    assert!(out.contains("#VALUE!"), "{out}");
+}
+
+#[test]
+fn date_system_1904() {
+    let dir = temp_dir("v06dates");
+    ok(&dir, &["create", "d.xlsx"]);
+    rewrite_zip_entry(
+        &dir.join("d.xlsx"),
+        "xl/workbook.xml",
+        "<sheets>",
+        r#"<workbookPr date1904="1"/><sheets>"#,
+    );
+    ok(&dir, &["set", "d.xlsx", "/Sheet1/A1", "--prop", "value=2026-07-15"]);
+    // Stored serial is 1904-based (1900-based would be 46218).
+    let sheet = zip_text(&dir.join("d.xlsx"), "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("<v>44756</v>"), "{sheet}");
+    // Reads back as the same ISO date, and date functions agree.
+    let got = ok(&dir, &["get", "d.xlsx", "/Sheet1/A1"]);
+    assert!(got.contains("2026-07-15"), "{got}");
+    let out = ok(&dir, &["calc", "d.xlsx", "=YEAR(A1)"]);
+    assert!(out.trim().ends_with("2026"), "{out}");
+}
+
+#[test]
+fn motion_path_animation() {
+    let dir = temp_dir("v06motion");
+    ok(&dir, &["create", "m.pptx"]);
+    ok(&dir, &["add", "m.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "m.pptx", "/slide[1]", "--type", "shape",
+        "--prop", "text=Wanderer", "--prop", "x=1in", "--prop", "y=1in",
+    ]);
+    ok(&dir, &[
+        "set", "m.pptx", "/slide[1]/shape[2]",
+        "--prop", "animation=motion-path", "--prop", "path=0.25,0.1 0.5,0",
+    ]);
+    let slide = zip_text(&dir.join("m.pptx"), "ppt/slides/slide1.xml");
+    assert!(slide.contains("p:animMotion"), "{slide}");
+    assert!(slide.contains("M 0 0 L 0.25 0.1 L 0.5 0 E"), "{slide}");
+    assert!(slide.contains(r#"presetClass="path""#), "{slide}");
+    // Missing path is a clear error.
+    let err = fails(&dir, &[
+        "set", "m.pptx", "/slide[1]/shape[2]", "--prop", "animation=motion-path",
+    ]);
+    assert!(err.contains("path="), "{err}");
+}
+
+#[test]
+fn native_pivot_table() {
+    let dir = temp_dir("v06pivot");
+    ok(&dir, &["create", "p.xlsx"]);
+    ok(&dir, &[
+        "add", "p.xlsx", "/Sheet1", "--type", "csv",
+        "--prop", "data=Region,Sales\nEast,100\nWest,80\nEast,120",
+    ]);
+    ok(&dir, &[
+        "add", "p.xlsx", "/", "--type", "pivot",
+        "--prop", "source=A1:B4", "--prop", "rows=Region",
+        "--prop", "values=Sales", "--prop", "native=true",
+    ]);
+    for part in [
+        "xl/pivotCache/pivotCacheDefinition1.xml",
+        "xl/pivotCache/pivotCacheRecords1.xml",
+        "xl/pivotTables/pivotTable1.xml",
+    ] {
+        let bytes = std::fs::read(dir.join("p.xlsx")).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(zip.by_name(part).is_ok(), "missing {part}");
+    }
+    let cd = zip_text(&dir.join("p.xlsx"), "xl/pivotCache/pivotCacheDefinition1.xml");
+    assert!(cd.contains(r#"refreshOnLoad="1""#) && cd.contains(r#"sheet="Sheet1""#), "{cd}");
+    let pt = zip_text(&dir.join("p.xlsx"), "xl/pivotTables/pivotTable1.xml");
+    assert!(pt.contains(r#"ref="A1:B4""#) && pt.contains("Sum of Sales"), "{pt}");
+    let wb = zip_text(&dir.join("p.xlsx"), "xl/workbook.xml");
+    assert!(wb.contains("<pivotCaches>"), "{wb}");
+    // The computed summary is still written for non-pivot-aware readers.
+    let text = ok(&dir, &["view", "p.xlsx", "text"]);
+    assert!(text.contains("Grand Total"), "{text}");
+}
+
+#[test]
+fn justified_text_renders() {
+    let dir = temp_dir("v06just");
+    ok(&dir, &["create", "j.docx"]);
+    ok(&dir, &[
+        "add", "j.docx", "/body", "--type", "paragraph", "--prop", "align=justify",
+        "--prop", "text=Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud.",
+    ]);
+    let doc = zip_text(&dir.join("j.docx"), "word/document.xml");
+    assert!(doc.contains(r#"w:val="both""#), "{doc}");
+    ok(&dir, &["view", "j.docx", "screenshot", "-o", "j.png"]);
+    let png = std::fs::read(dir.join("j.png"))
+        .or_else(|_| std::fs::read(dir.join("j-1.png")))
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+}

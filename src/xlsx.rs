@@ -36,6 +36,9 @@ pub struct Xlsx {
     styles: XmlElement,
     shared: Vec<String>,
     sheets: Vec<Sheet>,
+    /// Workbook uses the 1904 date system (workbookPr date1904, classic
+    /// Mac Excel). Serials are 1462 days behind the 1900 system.
+    date1904: bool,
 }
 
 impl Xlsx {
@@ -44,6 +47,11 @@ impl Xlsx {
         let rels = pkg.xml(WORKBOOK_RELS_PART)?;
         let styles = pkg.xml(STYLES_PART)?;
         let shared = load_shared_strings(&pkg)?;
+        let date1904 = workbook
+            .child("workbookPr")
+            .and_then(|p| p.attr_local("date1904"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         let mut sheets = Vec::new();
         if let Some(sheets_el) = workbook.child("sheets") {
@@ -67,7 +75,18 @@ impl Xlsx {
             styles,
             shared,
             sheets,
+            date1904,
         })
+    }
+
+    /// Serial offset between this workbook's date system and the 1900
+    /// system the conversion helpers use.
+    fn date_offset(&self) -> f64 {
+        if self.date1904 {
+            DATE_1904_OFFSET
+        } else {
+            0.0
+        }
     }
 
     fn sheet_index(&self, seg: &path::Segment) -> Result<usize> {
@@ -116,7 +135,7 @@ impl Xlsx {
                             DateKind::DateTime => (true, true, "datetime"),
                             DateKind::Time => (false, true, "time"),
                         };
-                        return (serial_to_iso(serial, wd, wt), label);
+                        return (serial_to_iso(serial + self.date_offset(), wd, wt), label);
                     }
                 }
                 (v, "number")
@@ -159,7 +178,14 @@ impl Xlsx {
         info.text = Some(value);
         info.attr("type", typ);
         if let Some(f) = c.child("f") {
-            info.attr("formula", format!("={}", f.text_content()));
+            info.attr(
+                "formula",
+                if f.attr_local("t") == Some("array") {
+                    format!("{{={}}}", f.text_content())
+                } else {
+                    format!("={}", f.text_content())
+                },
+            );
         }
         if let Some(r) = c.attr_local("r") {
             info.attr("ref", format!("{}!{}", sheet.name, r));
@@ -294,7 +320,7 @@ impl Xlsx {
             let date_requested = matches!(hint, Some("date") | Some("datetime") | Some("time"));
             if (hint.is_none() || date_requested) && !value.starts_with('=') {
                 if let Some((serial, has_date, has_time)) = parse_iso_datetime(value) {
-                    value_override = Some(format!("{serial}"));
+                    value_override = Some(format!("{}", serial - self.date_offset()));
                     if style_props.num_fmt.is_none() {
                         style_props.num_fmt = Some(
                             match (has_date, has_time) {
@@ -858,7 +884,7 @@ impl Xlsx {
             Ok(())
         };
         set(self, 0, 0, headers[(rows_col - c0) as usize].clone(), true)?;
-        set(self, 1, 0, value_label, true)?;
+        set(self, 1, 0, value_label.clone(), true)?;
         let mut grand: Vec<f64> = Vec::new();
         for (i, key) in order.iter().enumerate() {
             let vals = &groups[key];
@@ -873,8 +899,330 @@ impl Xlsx {
         let mut info = NodeInfo::new(format!("/{name}"), "sheet");
         info.attr("kind", "pivot");
         info.attr("groups", order.len().to_string());
-        info.attr("agg", agg);
+        info.attr("agg", agg.clone());
+
+        // --prop native=true additionally overlays a real PivotTable
+        // definition (cache + table parts, refreshOnLoad) on the summary,
+        // so Excel shows an interactive pivot over the same cells.
+        if props.get_bool("native")?.unwrap_or(false) {
+            self.add_native_pivot_parts(
+                src_idx,
+                (c0, r0),
+                (c1, r1),
+                rows_col,
+                values_col,
+                &agg,
+                &order,
+                pivot_idx,
+                &value_label,
+            )?;
+            info.attr("native", "true");
+        }
         Ok(Report::Nodes(vec![info]))
+    }
+
+    /// The parts behind a native PivotTable: pivotCacheDefinition (+records)
+    /// wired into the workbook, and a pivotTableDefinition on the pivot
+    /// sheet covering the computed summary cells.
+    #[allow(clippy::too_many_arguments)]
+    fn add_native_pivot_parts(
+        &mut self,
+        src_idx: usize,
+        from: (u32, u32),
+        to: (u32, u32),
+        rows_col: u32,
+        values_col: Option<u32>,
+        agg: &str,
+        order: &[String],
+        pivot_idx: usize,
+        value_label: &str,
+    ) -> Result<()> {
+        const NS_MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        const NS_REL: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let (c0, r0) = from;
+        let (c1, r1) = to;
+        let headers: Vec<String> = (c0..=c1).map(|c| self.value_at(src_idx, c, r0)).collect();
+        let nfields = (c1 - c0 + 1) as usize;
+        let row_field = (rows_col - c0) as usize;
+        let data_field = values_col.map(|vc| (vc - c0) as usize).unwrap_or(row_field);
+
+        let next_num = |pkg: &Package, prefix: &str, suffix: &str| -> u32 {
+            pkg.part_names()
+                .filter_map(|p| {
+                    p.strip_prefix(prefix)
+                        .and_then(|s| s.strip_suffix(suffix))
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                + 1
+        };
+        let cache_num = next_num(&self.pkg, "xl/pivotCache/pivotCacheDefinition", ".xml");
+        let table_num = next_num(&self.pkg, "xl/pivotTables/pivotTable", ".xml");
+        let cache_id = self
+            .workbook
+            .child("pivotCaches")
+            .map(|pcs| {
+                pcs.children_named("pivotCache")
+                    .iter()
+                    .filter_map(|pc| pc.attr_local("cacheId")?.parse::<u32>().ok())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            + 1;
+
+        // Records: one per non-empty data row, row-field values as shared
+        // item indexes, everything else inline.
+        let mut recs = el(
+            "pivotCacheRecords",
+            &[("xmlns", NS_MAIN), ("xmlns:r", NS_REL)],
+        );
+        let mut record_count = 0u32;
+        for r in (r0 + 1)..=r1 {
+            let key = self.value_at(src_idx, rows_col, r);
+            if key.is_empty() {
+                continue;
+            }
+            let mut rec = XmlElement::new("r");
+            for c in c0..=c1 {
+                let v = self.value_at(src_idx, c, r);
+                if c == rows_col {
+                    let idx = order.iter().position(|k| *k == key).unwrap_or(0);
+                    rec.push(el("x", &[("v", idx.to_string().as_str())]));
+                } else if v.is_empty() {
+                    rec.push(XmlElement::new("m"));
+                } else if v.parse::<f64>().is_ok() {
+                    rec.push(el("n", &[("v", v.trim())]));
+                } else {
+                    rec.push(el("s", &[("v", v.as_str())]));
+                }
+            }
+            recs.push(rec);
+            record_count += 1;
+        }
+        recs.set_attr("count", &record_count.to_string());
+
+        // Cache definition over the worksheet source range.
+        let source_ref = format!("{}:{}", cell_name(c0, r0), cell_name(c1, r1));
+        let mut cd = el(
+            "pivotCacheDefinition",
+            &[
+                ("xmlns", NS_MAIN),
+                ("xmlns:r", NS_REL),
+                ("r:id", "rId1"),
+                ("refreshOnLoad", "1"),
+                ("refreshedBy", "officecli"),
+                ("refreshedVersion", "8"),
+                ("minRefreshableVersion", "3"),
+                ("createdVersion", "8"),
+                ("recordCount", record_count.to_string().as_str()),
+            ],
+        );
+        let mut cs = el("cacheSource", &[("type", "worksheet")]);
+        cs.push(el(
+            "worksheetSource",
+            &[
+                ("ref", source_ref.as_str()),
+                ("sheet", self.sheets[src_idx].name.as_str()),
+            ],
+        ));
+        cd.push(cs);
+        let mut cfs = el("cacheFields", &[("count", nfields.to_string().as_str())]);
+        for (i, h) in headers.iter().enumerate() {
+            let mut cf = el("cacheField", &[("name", h.as_str()), ("numFmtId", "0")]);
+            if i == row_field {
+                let mut si = el("sharedItems", &[("count", order.len().to_string().as_str())]);
+                for item in order {
+                    si.push(el("s", &[("v", item.as_str())]));
+                }
+                cf.push(si);
+            } else {
+                cf.push(XmlElement::new("sharedItems"));
+            }
+            cfs.push(cf);
+        }
+        cd.push(cfs);
+
+        // Pivot table over the computed summary cells (A1:B{n+2}).
+        let mut pt = el(
+            "pivotTableDefinition",
+            &[
+                ("xmlns", NS_MAIN),
+                ("name", format!("PivotTable{table_num}").as_str()),
+                ("cacheId", cache_id.to_string().as_str()),
+                ("applyNumberFormats", "0"),
+                ("applyBorderFormats", "0"),
+                ("applyFontFormats", "0"),
+                ("applyPatternFormats", "0"),
+                ("applyAlignmentFormats", "0"),
+                ("applyWidthHeightFormats", "1"),
+                ("dataCaption", "Values"),
+                ("updatedVersion", "8"),
+                ("createdVersion", "8"),
+                ("indent", "0"),
+                ("outline", "1"),
+                ("outlineData", "1"),
+                ("useAutoFormatting", "1"),
+                ("itemPrintTitles", "1"),
+            ],
+        );
+        pt.push(el(
+            "location",
+            &[
+                ("ref", format!("A1:B{}", order.len() + 2).as_str()),
+                ("firstHeaderRow", "1"),
+                ("firstDataRow", "1"),
+                ("firstDataCol", "1"),
+            ],
+        ));
+        let mut pfs = el("pivotFields", &[("count", nfields.to_string().as_str())]);
+        for i in 0..nfields {
+            if i == row_field {
+                let mut pf = el("pivotField", &[("axis", "axisRow"), ("showAll", "0")]);
+                if values_col.is_none() {
+                    pf.set_attr("dataField", "1");
+                }
+                let mut items =
+                    el("items", &[("count", (order.len() + 1).to_string().as_str())]);
+                for k in 0..order.len() {
+                    items.push(el("item", &[("x", k.to_string().as_str())]));
+                }
+                items.push(el("item", &[("t", "default")]));
+                pf.push(items);
+                pfs.push(pf);
+            } else if i == data_field {
+                pfs.push(el("pivotField", &[("dataField", "1"), ("showAll", "0")]));
+            } else {
+                pfs.push(el("pivotField", &[("showAll", "0")]));
+            }
+        }
+        pt.push(pfs);
+        let mut rfs = el("rowFields", &[("count", "1")]);
+        rfs.push(el("field", &[("x", row_field.to_string().as_str())]));
+        pt.push(rfs);
+        let mut ris = el("rowItems", &[("count", (order.len() + 1).to_string().as_str())]);
+        for k in 0..order.len() {
+            let mut i_el = XmlElement::new("i");
+            if k == 0 {
+                i_el.push(XmlElement::new("x"));
+            } else {
+                i_el.push(el("x", &[("v", k.to_string().as_str())]));
+            }
+            ris.push(i_el);
+        }
+        let mut grand = el("i", &[("t", "grand")]);
+        grand.push(XmlElement::new("x"));
+        ris.push(grand);
+        pt.push(ris);
+        let mut cis = el("colItems", &[("count", "1")]);
+        cis.push(XmlElement::new("i"));
+        pt.push(cis);
+        let mut dfs = el("dataFields", &[("count", "1")]);
+        let mut df = el(
+            "dataField",
+            &[
+                ("name", value_label),
+                ("fld", data_field.to_string().as_str()),
+                ("baseField", "0"),
+                ("baseItem", "0"),
+            ],
+        );
+        match agg {
+            "count" => df.set_attr("subtotal", "count"),
+            "avg" | "average" => df.set_attr("subtotal", "average"),
+            "min" => df.set_attr("subtotal", "min"),
+            "max" => df.set_attr("subtotal", "max"),
+            _ => {}
+        }
+        dfs.push(df);
+        pt.push(dfs);
+        pt.push(el(
+            "pivotTableStyleInfo",
+            &[
+                ("name", "PivotStyleLight16"),
+                ("showRowHeaders", "1"),
+                ("showColHeaders", "1"),
+                ("showRowStripes", "0"),
+                ("showColStripes", "0"),
+                ("showLastColumn", "1"),
+            ],
+        ));
+
+        // Parts, content types, and the relationship chain: workbook →
+        // cacheDefinition → records, and pivot sheet → pivotTable → cache.
+        let cd_part = format!("xl/pivotCache/pivotCacheDefinition{cache_num}.xml");
+        let recs_part = format!("xl/pivotCache/pivotCacheRecords{cache_num}.xml");
+        let pt_part = format!("xl/pivotTables/pivotTable{table_num}.xml");
+        self.pkg.put_xml(&cd_part, &cd)?;
+        self.pkg.put_xml(&recs_part, &recs)?;
+        self.pkg.put_xml(&pt_part, &pt)?;
+        self.pkg.add_override(
+            &cd_part,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
+        )?;
+        self.pkg.add_override(
+            &recs_part,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml",
+        )?;
+        self.pkg.add_override(
+            &pt_part,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+        )?;
+
+        let mut cd_rels = crate::xml::parse(EMPTY_RELS_XML.as_bytes())?;
+        crate::media::add_relationship(
+            &mut cd_rels,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords",
+            &format!("pivotCacheRecords{cache_num}.xml"),
+        );
+        self.pkg.put_xml(
+            &format!("xl/pivotCache/_rels/pivotCacheDefinition{cache_num}.xml.rels"),
+            &cd_rels,
+        )?;
+
+        let mut pt_rels = crate::xml::parse(EMPTY_RELS_XML.as_bytes())?;
+        crate::media::add_relationship(
+            &mut pt_rels,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition",
+            &format!("../pivotCache/pivotCacheDefinition{cache_num}.xml"),
+        );
+        self.pkg.put_xml(
+            &format!("xl/pivotTables/_rels/pivotTable{table_num}.xml.rels"),
+            &pt_rels,
+        )?;
+
+        // Workbook: rel to the cache definition + a pivotCaches entry.
+        let rid = crate::media::add_relationship(
+            &mut self.rels,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition",
+            &format!("pivotCache/pivotCacheDefinition{cache_num}.xml"),
+        );
+        if self.workbook.child("pivotCaches").is_none() {
+            self.workbook.push(XmlElement::new("pivotCaches"));
+        }
+        let pcs = self.workbook.child_mut("pivotCaches").unwrap();
+        pcs.push(el(
+            "pivotCache",
+            &[("cacheId", cache_id.to_string().as_str()), ("r:id", rid.as_str())],
+        ));
+
+        // Pivot sheet → pivotTable rel.
+        let sheet_part = self.sheets[pivot_idx].part.clone();
+        let sheet_rels_part = sheet_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        let mut sheet_rels = if self.pkg.has_part(&sheet_rels_part) {
+            self.pkg.xml(&sheet_rels_part)?
+        } else {
+            crate::xml::parse(EMPTY_RELS_XML.as_bytes())?
+        };
+        crate::media::add_relationship(
+            &mut sheet_rels,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+            &format!("../pivotTables/pivotTable{table_num}.xml"),
+        );
+        self.pkg.put_xml(&sheet_rels_part, &sheet_rels)?;
+        Ok(())
     }
 
     /// Attach a hyperlink to a cell: worksheet <hyperlinks> entry, external
@@ -1320,6 +1668,10 @@ impl crate::formula::CellSource for Xlsx {
     fn has_sheet(&self, sheet: &str) -> bool {
         self.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(sheet))
     }
+
+    fn date1904(&self) -> bool {
+        self.date1904
+    }
 }
 
 fn parse_cell_ref_opt(r: &str) -> Option<(u32, u32)> {
@@ -1399,6 +1751,8 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 const UNIX_EPOCH_SERIAL: f64 = 25_569.0; // 1970-01-01 as an Excel serial
+/// Days between the 1900 and 1904 date-system epochs.
+const DATE_1904_OFFSET: f64 = 1_462.0;
 
 /// Excel serial for a civil date (shared with the formula evaluator).
 pub(crate) fn date_serial(y: i64, m: u32, d: u32) -> f64 {
@@ -1794,7 +2148,9 @@ fn write_cell_value(c: &mut XmlElement, value: &str, type_hint: Option<&str>) ->
     clear_cell_content(c);
     let hint = type_hint.map(|t| t.to_ascii_lowercase());
     let hint = hint.as_deref();
-    if hint == Some("formula") || (hint.is_none() && value.starts_with('=')) {
+    if hint == Some("formula")
+        || (hint.is_none() && (value.starts_with('=') || value.starts_with("{=")))
+    {
         write_cell_formula(c, value);
         return Ok(());
     }
@@ -1841,9 +2197,21 @@ fn write_inline_string(c: &mut XmlElement, value: &str) {
 }
 
 fn write_cell_formula(c: &mut XmlElement, formula: &str) {
+    let cell_ref = c.attr_local("r").map(String::from);
     clear_cell_content(c);
     let mut f = XmlElement::new("f");
-    f.push_text(formula.strip_prefix('=').unwrap_or(formula));
+    let trimmed = formula.trim();
+    // Legacy array formula: {=...} stores t="array" anchored on the cell.
+    if let Some(inner) = trimmed.strip_prefix("{=").and_then(|s| s.strip_suffix('}')) {
+        f.set_attr("t", "array");
+        if let Some(r) = cell_ref {
+            f.set_attr("ref", &r);
+        }
+        f.set_attr("aca", "1");
+        f.push_text(inner);
+    } else {
+        f.push_text(trimmed.strip_prefix('=').unwrap_or(trimmed));
+    }
     c.push(f);
 }
 
@@ -3427,7 +3795,12 @@ impl Handler for Xlsx {
                     let Some(r) = c.attr_local("r") else { continue };
                     let mut props = serde_json::Map::new();
                     if let Some(f) = c.child("f") {
-                        props.insert("value".into(), json!(format!("={}", f.text_content())));
+                        let formula = if f.attr_local("t") == Some("array") {
+                            format!("{{={}}}", f.text_content())
+                        } else {
+                            format!("={}", f.text_content())
+                        };
+                        props.insert("value".into(), json!(formula));
                     } else {
                         let (value, typ) = self.cell_display(c);
                         if value.is_empty() {

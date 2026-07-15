@@ -2728,7 +2728,8 @@ impl Handler for Docx {
                         let canvas_probe = pages.last().unwrap();
                         let usable = content_w - left_indent;
                         let lines = canvas_probe.layout_spans(&spans, usable);
-                        for line in lines {
+                        let last_line = lines.len().saturating_sub(1);
+                        for (li, line) in lines.into_iter().enumerate() {
                             need!(line_h);
                             let canvas = pages.last_mut().unwrap();
                             let lw = canvas.spans_width(&line);
@@ -2738,7 +2739,13 @@ impl Handler for Docx {
                                 _ => margin,
                             } + left_indent;
                             let asc = canvas.ascent(max_size, base_bold);
-                            canvas.draw_spans_line(&line, lx, y + asc);
+                            // jc=both stretches every line except the last.
+                            if matches!(align, Some("both") | Some("distribute")) && li < last_line
+                            {
+                                canvas.draw_spans_justified(&line, lx, y + asc, usable);
+                            } else {
+                                canvas.draw_spans_line(&line, lx, y + asc);
+                            }
                             y += line_h;
                         }
                         y += line_h * 0.3;

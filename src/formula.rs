@@ -28,6 +28,11 @@ pub trait CellSource {
     /// `sheet` is always fully qualified by the evaluator.
     fn cell(&self, sheet: &str, col: u32, row: u32) -> CellContent;
     fn has_sheet(&self, sheet: &str) -> bool;
+    /// Whether the workbook uses the 1904 date system (serials shifted by
+    /// 1462 days). Date functions respect it.
+    fn date1904(&self) -> bool {
+        false
+    }
 }
 
 /// A computed value.
@@ -38,6 +43,10 @@ pub enum Value {
     Bool(bool),
     Empty,
     Err(String),
+    /// Intermediate array (a range in a scalar expression, or the result of
+    /// an elementwise operation). Reduced to its first element — Excel's
+    /// implicit intersection — when a scalar is required.
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -56,6 +65,7 @@ impl Value {
             Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Value::Empty => String::new(),
             Value::Err(e) => e.clone(),
+            Value::Array(items) => items.first().map(|v| v.display()).unwrap_or_default(),
         }
     }
 
@@ -66,6 +76,18 @@ impl Value {
             Value::Bool(_) => "boolean",
             Value::Empty => "empty",
             Value::Err(_) => "error",
+            Value::Array(_) => "array",
+        }
+    }
+
+    /// Implicit intersection: an array collapses to its first element.
+    fn scalar(&self) -> Value {
+        match self {
+            Value::Array(items) => items
+                .first()
+                .map(|v| v.scalar())
+                .unwrap_or(Value::Err("#VALUE!".into())),
+            other => other.clone(),
         }
     }
 
@@ -79,6 +101,7 @@ impl Value {
                 .parse::<f64>()
                 .map_err(|_| Value::Err("#VALUE!".into())),
             Value::Err(_) => Err(self.clone()),
+            Value::Array(_) => self.scalar().as_number(),
         }
     }
 
@@ -98,6 +121,7 @@ impl Value {
             Value::Text(t) if t.eq_ignore_ascii_case("false") => Ok(false),
             Value::Text(_) => Err(Value::Err("#VALUE!".into())),
             Value::Err(_) => Err(self.clone()),
+            Value::Array(_) => self.scalar().as_bool(),
         }
     }
 }
@@ -568,7 +592,11 @@ impl<'a> Evaluator<'a> {
             }
         };
         *self.depth.borrow_mut() -= 1;
-        result
+        // A single-cell array formula shows its first element.
+        match result {
+            Value::Array(_) => result.scalar(),
+            r => r,
+        }
     }
 
     fn eval_cell(&self, sheet: &str, col: u32, row: u32) -> Value {
@@ -610,7 +638,11 @@ impl<'a> Evaluator<'a> {
                 Ok(())
             }
             other => {
-                out.push(self.eval(sheet, other));
+                match self.eval(sheet, other) {
+                    // Elementwise results feed aggregates value-by-value.
+                    Value::Array(items) => out.extend(items),
+                    v => out.push(v),
+                }
                 Ok(())
             }
         }
@@ -652,14 +684,41 @@ impl<'a> Evaluator<'a> {
                 }
                 self.eval_cell(sname, *col, *row)
             }
-            Expr::Range { .. } => Value::Err("#VALUE! (range used as a scalar)".into()),
-            Expr::Neg(inner) => match self.eval(sheet, inner).as_number() {
-                Ok(n) => Value::Number(-n),
-                Err(e) => e,
+            // A bare range in a scalar expression becomes an array, which
+            // elementwise operators broadcast over ({=SUM(A1:A3*B1:B3)}).
+            Expr::Range { .. } => match self.range_grid(sheet, e) {
+                Ok((_, _, vals)) => Value::Array(vals),
+                Err(err) => err,
             },
-            Expr::Percent(inner) => match self.eval(sheet, inner).as_number() {
-                Ok(n) => Value::Number(n / 100.0),
-                Err(e) => e,
+            Expr::Neg(inner) => match self.eval(sheet, inner) {
+                Value::Array(items) => Value::Array(
+                    items
+                        .into_iter()
+                        .map(|v| match v.as_number() {
+                            Ok(n) => Value::Number(-n),
+                            Err(e) => e,
+                        })
+                        .collect(),
+                ),
+                v => match v.as_number() {
+                    Ok(n) => Value::Number(-n),
+                    Err(e) => e,
+                },
+            },
+            Expr::Percent(inner) => match self.eval(sheet, inner) {
+                Value::Array(items) => Value::Array(
+                    items
+                        .into_iter()
+                        .map(|v| match v.as_number() {
+                            Ok(n) => Value::Number(n / 100.0),
+                            Err(e) => e,
+                        })
+                        .collect(),
+                ),
+                v => match v.as_number() {
+                    Ok(n) => Value::Number(n / 100.0),
+                    Err(e) => e,
+                },
             },
             Expr::Bin(op, l, r) => self.eval_bin(sheet, op, l, r),
             Expr::Func(name, args) => self.eval_func(sheet, name, args),
@@ -669,6 +728,43 @@ impl<'a> Evaluator<'a> {
     fn eval_bin(&self, sheet: &str, op: &Op, l: &Expr, r: &Expr) -> Value {
         let lv = self.eval(sheet, l);
         let rv = self.eval(sheet, r);
+        if let Value::Err(_) = lv {
+            return lv;
+        }
+        if let Value::Err(_) = rv {
+            return rv;
+        }
+        // Elementwise broadcasting: array op array (equal lengths) or
+        // array op scalar.
+        if matches!(lv, Value::Array(_)) || matches!(rv, Value::Array(_)) {
+            let (la, ra) = (lv.clone(), rv.clone());
+            let len = match (&la, &ra) {
+                (Value::Array(a), Value::Array(b)) => {
+                    if a.len() != b.len() {
+                        return Value::Err("#VALUE! (arrays differ in size)".into());
+                    }
+                    a.len()
+                }
+                (Value::Array(a), _) => a.len(),
+                (_, Value::Array(b)) => b.len(),
+                _ => unreachable!(),
+            };
+            let pick = |v: &Value, i: usize| -> Value {
+                match v {
+                    Value::Array(items) => items.get(i).cloned().unwrap_or(Value::Empty),
+                    scalar => scalar.clone(),
+                }
+            };
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                out.push(Self::scalar_bin(op, pick(&la, i), pick(&ra, i)));
+            }
+            return Value::Array(out);
+        }
+        Self::scalar_bin(op, lv, rv)
+    }
+
+    fn scalar_bin(op: &Op, lv: Value, rv: Value) -> Value {
         if let Value::Err(_) = lv {
             return lv;
         }
@@ -727,11 +823,13 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 let mut nums = Vec::new();
-                for v in vals {
+                // Nested arrays were already expanded by flatten.
+                while let Some(v) = vals.pop() {
                     match v {
                         Value::Number(n) => nums.push(n),
                         Value::Bool(_) | Value::Text(_) | Value::Empty => {} // aggregates skip non-numbers
                         Value::Err(_) => return v,
+                        Value::Array(items) => vals.extend(items),
                     }
                 }
                 nums
@@ -1203,24 +1301,27 @@ impl<'a> Evaluator<'a> {
                 }
             }
             "TODAY" | "NOW" => {
+                let off = if self.source.date1904() { 1_462.0 } else { 0.0 };
                 let secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
-                let serial = secs / 86_400.0 + 25_569.0;
+                let serial = secs / 86_400.0 + 25_569.0 - off;
                 Value::Number(if name == "TODAY" { serial.floor() } else { serial })
             }
             "DATE" => {
                 need!(3);
+                let off = if self.source.date1904() { 1_462.0 } else { 0.0 };
                 let (y, m, d) = (arg_num!(0) as i64, arg_num!(1) as u32, arg_num!(2) as u32);
                 if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
                     return Value::Err("#NUM!".into());
                 }
-                Value::Number(crate::xlsx::date_serial(y, m, d))
+                Value::Number(crate::xlsx::date_serial(y, m, d) - off)
             }
             "YEAR" | "MONTH" | "DAY" => {
                 need!(1);
-                let serial = arg_num!(0);
+                let off = if self.source.date1904() { 1_462.0 } else { 0.0 };
+                let serial = arg_num!(0) + off;
                 let (y, m, d) = crate::xlsx::serial_civil(serial);
                 Value::Number(match name {
                     "YEAR" => y as f64,
@@ -1256,7 +1357,7 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             Value::Number(_) | Value::Empty => 0,
             Value::Text(_) => 1,
             Value::Bool(_) => 2,
-            Value::Err(_) => 3,
+            Value::Err(_) | Value::Array(_) => 3,
         }
     }
     match (a, b) {

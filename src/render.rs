@@ -351,6 +351,36 @@ impl Canvas {
         }
     }
 
+    /// Draw a line stretched to `width` by widening word gaps (justified
+    /// alignment). Falls back to normal drawing when the line has fewer
+    /// than two words or already fills the width.
+    pub fn draw_spans_justified(&mut self, line: &[Span], x: f32, baseline: f32, width: f32) {
+        let mut words: Vec<(String, f32, Color, bool, bool)> = Vec::new();
+        for span in line {
+            for w in span.text.split(' ').filter(|w| !w.is_empty()) {
+                words.push((w.to_string(), span.size, span.color, span.bold, span.italic));
+            }
+        }
+        if words.len() < 2 {
+            self.draw_spans_line(line, x, baseline);
+            return;
+        }
+        let words_w: f32 = words
+            .iter()
+            .map(|(t, s, _, b, _)| self.text_width(t, *s, *b))
+            .sum();
+        let gap = (width - words_w) / (words.len() - 1) as f32;
+        if gap <= 0.0 {
+            self.draw_spans_line(line, x, baseline);
+            return;
+        }
+        let mut caret = x;
+        for (t, s, c, b, i) in words {
+            caret += self.draw_text_styled(&t, caret, baseline, s, c, b, i);
+            caret += gap;
+        }
+    }
+
     /// Composite image bytes (PNG, JPEG, or GIF first frame) into the given
     /// rectangle, scaled to fit exactly. Undecodable bytes draw a
     /// placeholder. Returns whether the image decoded.

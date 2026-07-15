@@ -162,6 +162,7 @@ SET (cells are created on demand)
   value=42            number (auto-detected)
   value=2026-07-10    real date cell (auto-detected; type=string opts out)
   value="=SUM(A1:A9)" formula (auto-detected by leading '=')
+  value="{=SUM(A1:A3*B1:B3)}"  legacy array formula (t="array")
   type=string|number|boolean|date|formula   forces interpretation
   format=date|datetime|time|percent|currency|integer|0.00|custom-code
   url=https://...     hyperlink (styled blue + underline)
@@ -181,7 +182,9 @@ FORMULAS (get --computed / calc)
   LOWER TRIM PROPER SUBSTITUTE TEXTJOIN VALUE  SUMIF COUNTIF AVERAGEIF
   VLOOKUP INDEX MATCH  TODAY NOW DATE YEAR MONTH DAY
   Cross-sheet refs (Sheet2!A1), ranges, operators + - * / ^ & = <> < > <= >=,
+  elementwise array broadcasting (=SUM(A1:A3*B1:B3), =SUM((A1:A3>2)*B1:B3)),
   cycle detection (#CIRC!). Errors: #DIV/0! #REF! #NAME? #VALUE! #N/A
+  Dates respect the workbook's 1900 or 1904 (workbookPr date1904) system.
 
 SORT
   officecli sort data.xlsx 'Sheet1!A2:C99' --by B [--desc]
@@ -204,8 +207,8 @@ ADD
                  w/h (in cells); references live cells
   --type pivot   props: source=A1:C9, rows=Header, values=Header,
                  agg=sum|count|avg|min|max, name; writes a computed group-by
-                 summary to a new sheet (static table, not an interactive
-                 PivotTable)
+                 summary to a new sheet. native=true additionally overlays
+                 a real PivotTable (cache + refreshOnLoad) on those cells
   --type csv     props: src=file.csv (or data=...), at=A1; values are
                  auto-typed (numbers, dates, strings)
 
@@ -261,8 +264,10 @@ SET
                  [speed=slow|medium|fast or a duration] [advance=5s]
   shape          text (replaces content), x/y/w/h, fill, name, url, and
                  size/color/bold/italic/font/align applied to all runs
-                 animation=appear|fade|wipe|fly-in (click-triggered
-                 entrance; fly-in takes direction=left|right|top|bottom;
+                 animation=appear|fade|wipe|fly-in|motion-path
+                 (click-triggered; fly-in takes direction=left|right|
+                 top|bottom; motion-path takes path="0.25,0.1 0.5,0"
+                 slide-fraction waypoints or a raw "M 0 0 L ... E" string;
                  [duration=500ms] [delay=0ms])
 
 COPY  officecli copy deck.pptx '/slide[1]'   duplicate (content + notes)

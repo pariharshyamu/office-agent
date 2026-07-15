@@ -369,11 +369,16 @@ LibreOffice, and draw with real axes/series in `view screenshot`.
 ```bash
 officecli add data.xlsx / --type pivot --prop source=A1:C99 \
     --prop rows=Region --prop values=Sales --prop agg=sum
+officecli add data.xlsx / --type pivot --prop source=A1:C99 \
+    --prop rows=Region --prop values=Sales --prop native=true
 ```
 
 Writes a computed group-by summary (`sum`/`count`/`avg`/`min`/`max` plus a
-Grand Total) to a new sheet. It is a static table, not a native interactive
-PivotTable — agents usually want the numbers, not the UI widget.
+Grand Total) to a new sheet — agents usually want the numbers, not the UI
+widget. With `native=true` the same cells also get a real PivotTable
+definition (pivot cache + records with `refreshOnLoad`), so Excel shows an
+interactive pivot that rebuilds from the source range on open (one row
+field and one value field; openpyxl parses it).
 
 ### Columns (xlsx)
 
@@ -427,7 +432,9 @@ Transitions: `fade`, `cut`, `push`, `wipe`, `dissolve`, `circle`, `diamond`,
 `checker`, `comb`, `strips`, `newsflash`, `random`, `none`. Animations are
 click-triggered entrance effects (`appear`, `fade`, `wipe`, and `fly-in`
 with `direction=left/right/top/bottom` built from ppt_x/ppt_y motion
-behaviors) in a standard `p:timing` tree.
+behaviors) in a standard `p:timing` tree, plus custom `motion-path`
+animations: `--prop path="0.25,0.1 0.5,0"` gives waypoints as fractions of
+the slide size (or pass a raw `"M 0 0 L ... E"` path string).
 
 ### view html, view screenshot, watch, and dump
 
@@ -449,9 +456,9 @@ officecli view deck.pptx screenshot -o deck.png
 ```
 
 The rendering is an approximation (positions, fills, text size/color/bold/
-italic, PNG/JPEG/GIF images, and charts drawn from their cached data with
-axes, series colors, and legends), designed to make layout problems visible
-rather than to be print-accurate.
+italic, left/center/right/justified alignment, PNG/JPEG/GIF images, and
+charts drawn from their cached data with axes, series colors, and legends),
+designed to make layout problems visible rather than to be print-accurate.
 
 `watch` serves the HTML view on localhost and auto-reloads the browser
 whenever the file changes on disk — edit with officecli in one terminal,
@@ -522,9 +529,11 @@ before/after/at index, whole-scope find/replace and find+format with run
 splitting, outline/text/stats/html/comments/screenshot views.
 
 **Excel (.xlsx)** — cells created on demand via `set` (strings, numbers,
-booleans, real dates/times, formulas auto-detected by `=`), a built-in
-formula evaluator (~45 functions incl. SUMPRODUCT/TEXTJOIN, `get
---computed`/`calc`), number formats (percent/currency/custom codes),
+booleans, real dates/times in both the 1900 and 1904 date systems, formulas
+auto-detected by `=`, array formulas via `{=SUM(A1:A3*B1:B3)}`), a built-in
+formula evaluator (~45 functions incl. SUMPRODUCT/TEXTJOIN, elementwise
+array broadcasting, `get --computed`/`calc`), number formats
+(percent/currency/custom codes),
 hyperlinks, cell comments (with the VML note shapes Excel needs to show
 them; `view comments`, `--prop comment=` to set, empty to remove), CSV
 import/export, sort, merged cells, column widths and row heights,
@@ -532,7 +541,8 @@ shared-string-aware reads, cell styling (bold/italic/underline/color/size/
 font/fill) through a styles-table manager, sheets (add/rename/remove/copy),
 rows and columns (insert/remove/copy with shifts and workbook-wide
 formula-reference rewriting), charts over live ranges (column/bar/line/pie/
-scatter), computed pivot summaries, ranges on `get`, `$Sheet:A1` addressing,
+scatter), computed pivot summaries (+ opt-in native PivotTables), ranges on
+`get`, `$Sheet:A1` addressing,
 find/replace over string cells, grid/outline/stats/html/comments/screenshot
 views. Formulas are stored uncalculated with `fullCalcOnLoad` so
 Excel/LibreOffice recalculate on open.
@@ -544,7 +554,8 @@ size/color/bold/italic/font/align/fill/name/url, bullet/numbered lists with
 levels), tables (CSV-shaped data, styled header, editable cells), speaker
 notes, images, charts (column/bar/line/pie/scatter, each with an embedded
 workbook so PowerPoint's "Edit Data" opens a live sheet), slide transitions,
-entrance animations incl. directional fly-in motion, theme-color resolution
+entrance animations incl. directional fly-in and custom motion paths,
+theme-color resolution
 (schemeClr + HSL-based lumMod/lumOff), shape addressing by position,
 `@name=`, or `@id=`, slide background, find/replace across slides,
 outline/text/stats/html/notes/screenshot views.
@@ -560,20 +571,20 @@ Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
 
 This is a focused port, not a feature-complete clone. Honest edges of the
 implemented features: `view screenshot` is an approximation — PNG/JPEG/GIF
-images composite and charts draw from their cached data with axes, series
-colors, and legends, but it is not a print-accurate Office renderer (italics
-are synthetic obliques; justified text renders left-aligned); the formula
-evaluator covers ~45 common functions but not the full Excel library, array
-formulas, or the 1904 date system; pivots are computed summary tables, not
-native interactive PivotTables; xlsx cell comments are classic notes (with
-VML shapes), not threaded comments; animations cover click-triggered
-entrance effects (appear/fade/wipe/fly-in) — custom motion paths beyond the
-directional fly-in are not built; theme-color lumMod/lumOff transforms use
-HSL luminance like Office (within a rounding hair of PowerPoint's palette),
-while tint/shade remain linear blends; `dump` is a high-fidelity content
-replay, not a byte-identical round-trip. The architecture (lossless XML DOM
-over the zip package, one handler per format behind a common trait) is
-designed so the remaining gaps can be added incrementally.
+images composite, charts draw from their cached data, justified text
+stretches its word gaps, and italics are synthetic obliques, but it is not
+a print-accurate Office renderer; the formula evaluator covers ~45 common
+functions plus elementwise array broadcasting, not the full Excel library;
+native PivotTables (`--prop native=true`) support one row field and one
+data field over the computed summary — complex layouts (column fields,
+filters, multiple values) remain computed-only; xlsx cell comments are
+classic notes (with VML shapes), not threaded comments; theme-color
+lumMod/lumOff transforms use HSL luminance like Office (within a rounding
+hair of PowerPoint's palette), while tint/shade remain linear blends;
+`dump` is a high-fidelity content replay, not a byte-identical round-trip.
+The architecture (lossless XML DOM over the zip package, one handler per
+format behind a common trait) is designed so the remaining gaps can be
+added incrementally.
 
 ## Architecture
 
