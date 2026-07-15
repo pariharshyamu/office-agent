@@ -5,6 +5,7 @@
 
 mod batch;
 mod chart;
+mod chartdraw;
 mod diff;
 mod docx;
 mod formula;

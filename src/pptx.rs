@@ -81,6 +81,54 @@ fn load_theme_colors(pkg: &Package) -> std::collections::HashMap<String, String>
 }
 
 /// Apply DrawingML color transforms (lumMod/lumOff/shade/tint) approximately.
+/// RGB (0..255) to HSL (h in 0..360, s/l in 0..1).
+fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let (r, g, b) = (r / 255.0, g / 255.0, b / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < 1e-9 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } * 60.0;
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
+    if s <= 0.0 {
+        let v = l * 255.0;
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hk = h / 360.0;
+    let channel = |mut t: f64| -> f64 {
+        t = t.rem_euclid(1.0);
+        let v = if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        };
+        v * 255.0
+    };
+    (channel(hk + 1.0 / 3.0), channel(hk), channel(hk - 1.0 / 3.0))
+}
+
+/// Apply DrawingML color transforms. lumMod/lumOff operate on HSL
+/// luminance (matching Office's "Lighter/Darker N%" palette variants);
+/// shade/tint are per-channel blends toward black/white.
 fn apply_color_mods(hex: &str, clr: &XmlElement) -> String {
     let Ok(n) = u32::from_str_radix(hex, 16) else {
         return hex.to_string();
@@ -96,20 +144,35 @@ fn apply_color_mods(hex: &str, clr: &XmlElement) -> String {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v / 100_000.0);
         let Some(val) = val else { continue };
-        for c in rgb.iter_mut() {
-            match m.local_name() {
-                "lumMod" | "shade" => *c *= val,
-                "lumOff" => *c += 255.0 * val,
-                "tint" => *c = *c * val + 255.0 * (1.0 - val),
-                _ => {}
+        match m.local_name() {
+            "lumMod" | "lumOff" => {
+                let (h, s, mut l) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+                if m.local_name() == "lumMod" {
+                    l *= val;
+                } else {
+                    l += val;
+                }
+                let (r, g, b) = hsl_to_rgb(h, s, l.clamp(0.0, 1.0));
+                rgb = [r, g, b];
             }
+            "shade" => {
+                for c in rgb.iter_mut() {
+                    *c *= val;
+                }
+            }
+            "tint" => {
+                for c in rgb.iter_mut() {
+                    *c = *c * val + 255.0 * (1.0 - val);
+                }
+            }
+            _ => {}
         }
     }
     format!(
         "{:02X}{:02X}{:02X}",
-        rgb[0].clamp(0.0, 255.0) as u8,
-        rgb[1].clamp(0.0, 255.0) as u8,
-        rgb[2].clamp(0.0, 255.0) as u8
+        rgb[0].round().clamp(0.0, 255.0) as u8,
+        rgb[1].round().clamp(0.0, 255.0) as u8,
+        rgb[2].round().clamp(0.0, 255.0) as u8
     )
 }
 
@@ -556,6 +619,24 @@ impl Pptx {
         Ok(slide_pos)
     }
 
+    /// chartSpace XML behind a chart graphicFrame, resolved through the
+    /// slide rels (used by the screenshot renderer).
+    fn chart_space_for_frame(&self, slide: &Slide, frame: &XmlElement) -> Option<XmlElement> {
+        let rid = frame
+            .child("graphic")?
+            .child("graphicData")?
+            .child("chart")?
+            .attr_local("id")?;
+        let target = slide
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Id") == Some(rid))?
+            .attr_local("Target")?
+            .to_string();
+        self.pkg.xml(&resolve_target("ppt/slides", &target)).ok()
+    }
+
     /// Notes slide part linked from a slide, if any.
     fn notes_part_for_slide(slide: &Slide) -> Option<String> {
         slide
@@ -840,44 +921,12 @@ impl Pptx {
     /// series); the chart part stores it as cached literals.
     fn add_chart(&mut self, slide_idx: usize, props: &Props) -> Result<Report> {
         let kind = crate::chart::parse_kind(props.get("kind").unwrap_or("column"))?;
-        let cats: Vec<String> = props
-            .get("categories")
-            .or_else(|| props.get("cats"))
-            .map(|c| c.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default();
-        let parse_vals = |raw: &str| -> Result<Vec<f64>> {
-            raw.split(',')
-                .map(|s| {
-                    s.trim()
-                        .parse::<f64>()
-                        .map_err(|_| anyhow::anyhow!("'{}' is not a number in values", s.trim()))
-                })
-                .collect()
-        };
-        let mut series = Vec::new();
-        let first = props
-            .get("values")
-            .context("chart needs --prop values=10,20,30 (and usually --prop categories=A,B,C)")?;
-        series.push(crate::chart::Series {
-            name: props.get("series").unwrap_or("Series 1").to_string(),
-            cats: cats.clone(),
-            vals: parse_vals(first)?,
-            ..Default::default()
-        });
-        let mut n = 2;
-        while let Some(vals) = props.get(&format!("values{n}")) {
-            series.push(crate::chart::Series {
-                name: props
-                    .get(&format!("series{n}"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("Series {n}")),
-                cats: cats.clone(),
-                vals: parse_vals(vals)?,
-                ..Default::default()
-            });
-            n += 1;
-        }
-        let chart_space = crate::chart::build_chart_space(kind, props.get("title"), &series)?;
+        let mut series = crate::chart::inline_series(kind, props)?;
+        // Embed a real workbook with the data so "Edit Data" opens a sheet.
+        let workbook = crate::chart::embedded_workbook(&mut series)?;
+        let mut chart_space =
+            crate::chart::build_chart_space(kind, props.get("title"), &series)?;
+        crate::chart::attach_external_data(&mut chart_space, "rId1");
 
         let chart_num = self
             .pkg
@@ -894,6 +943,15 @@ impl Pptx {
         self.pkg.put_xml(&chart_part, &chart_space)?;
         self.pkg
             .add_override(&chart_part, crate::chart::CHART_CONTENT_TYPE)?;
+        let emb_part = format!("ppt/embeddings/Microsoft_Excel_Worksheet{chart_num}.xlsx");
+        self.pkg.put_raw(&emb_part, workbook);
+        self.pkg.add_default("xlsx", crate::chart::XLSX_CONTENT_TYPE)?;
+        self.pkg.put_xml(
+            &format!("ppt/charts/_rels/chart{chart_num}.xml.rels"),
+            &crate::chart::chart_rels_xml(&format!(
+                "../embeddings/Microsoft_Excel_Worksheet{chart_num}.xlsx"
+            )),
+        )?;
         let rid = crate::media::add_relationship(
             &mut self.slides[slide_idx].rels,
             crate::chart::CHART_REL_TYPE,
@@ -1157,21 +1215,64 @@ fn sp_target(spid: &str) -> XmlElement {
     tgt
 }
 
+/// A `p:anim` motion behavior interpolating one position attribute
+/// (ppt_x/ppt_y) from an off-slide formula to the shape's own position.
+fn motion_anim(spid: &str, attr_name: &str, from: &str, to: &str, duration_ms: u64) -> XmlElement {
+    let mut anim = el("p:anim", &[("calcmode", "lin"), ("valueType", "num")]);
+    let mut cbhvr = el("p:cBhvr", &[("additive", "base")]);
+    cbhvr.push(el(
+        "p:cTn",
+        &[("id", "0"), ("dur", duration_ms.to_string().as_str()), ("fill", "hold")],
+    ));
+    cbhvr.push(sp_target(spid));
+    let mut attrs = XmlElement::new("p:attrNameLst");
+    let mut a = XmlElement::new("p:attrName");
+    a.push_text(attr_name);
+    attrs.push(a);
+    cbhvr.push(attrs);
+    anim.push(cbhvr);
+    let mut tavs = XmlElement::new("p:tavLst");
+    for (tm, val) in [("0", from), ("100000", to)] {
+        let mut tav = el("p:tav", &[("tm", tm)]);
+        let mut v = XmlElement::new("p:val");
+        v.push(el("p:strVal", &[("val", val)]));
+        tav.push(v);
+        tavs.push(tav);
+    }
+    anim.push(tavs);
+    anim
+}
+
 /// Append one click-triggered entrance effect for shape `spid`.
 fn append_entrance_animation(
     slide_xml: &mut XmlElement,
     spid: &str,
     effect: &str,
+    direction: &str,
     duration_ms: u64,
     delay_ms: u64,
 ) -> Result<()> {
-    // (presetID, animEffect filter) — appear has no filter behavior.
-    let (preset_id, filter): (u32, Option<String>) = match effect.to_ascii_lowercase().as_str() {
+    // (presetID, animEffect filter) — appear has no filter behavior;
+    // fly-in uses motion behaviors instead of a filter.
+    let effect_lc = effect.to_ascii_lowercase();
+    let fly_in = matches!(effect_lc.as_str(), "fly-in" | "flyin" | "fly");
+    let (preset_id, filter): (u32, Option<String>) = match effect_lc.as_str() {
         "appear" => (1, None),
         "fade" | "fade-in" | "fadein" => (10, Some("fade".to_string())),
         "wipe" | "wipe-in" => (22, Some("wipe(bottom)".to_string())),
-        other => bail!("unknown animation '{other}' (appear/fade/wipe)"),
+        "fly-in" | "flyin" | "fly" => (2, None),
+        other => bail!("unknown animation '{other}' (appear/fade/wipe/fly-in)"),
     };
+    // Fly-in start position and PowerPoint's UI subtype code per direction.
+    let (preset_subtype, fly_from): (u32, (&str, &str)) =
+        match direction.to_ascii_lowercase().as_str() {
+            "bottom" | "up" => (4, ("#ppt_x", "1+#ppt_h/2")),
+            "top" | "down" => (1, ("#ppt_x", "0-#ppt_h/2")),
+            "left" => (8, ("0-#ppt_w/2", "#ppt_y")),
+            "right" => (2, ("1+#ppt_w/2", "#ppt_y")),
+            other => bail!("unknown direction '{other}' (left/right/top/bottom)"),
+        };
+    let preset_subtype = if fly_in { preset_subtype } else { 0 };
     let mut next_id = max_ctn_id(slide_xml.child("timing").unwrap_or(&XmlElement::new("x"))) + 1;
     if next_id < 3 {
         next_id = 3;
@@ -1216,6 +1317,11 @@ fn append_entrance_animation(
         anim.push(cbhvr);
         behaviors.push(anim);
     }
+    if fly_in {
+        let (fx, fy) = fly_from;
+        behaviors.push(motion_anim(spid, "ppt_x", fx, "#ppt_x", duration_ms));
+        behaviors.push(motion_anim(spid, "ppt_y", fy, "#ppt_y", duration_ms));
+    }
 
     // Click group scaffolding, innermost first.
     let mut effect_ctn = el(
@@ -1224,7 +1330,7 @@ fn append_entrance_animation(
             ("id", "0"),
             ("presetID", preset_id.to_string().as_str()),
             ("presetClass", "entr"),
-            ("presetSubtype", "0"),
+            ("presetSubtype", preset_subtype.to_string().as_str()),
             ("fill", "hold"),
             ("nodeType", "clickEffect"),
         ],
@@ -1984,10 +2090,12 @@ impl Handler for Pptx {
                 .transpose()?
                 .unwrap_or(500);
             let delay = props.get("delay").map(parse_duration_ms).transpose()?.unwrap_or(0);
+            let direction = props.get("direction").unwrap_or("bottom").to_string();
             append_entrance_animation(
                 &mut self.slides[slide_idx].xml,
                 &spid,
                 effect,
+                &direction,
                 duration,
                 delay,
             )?;
@@ -2586,8 +2694,16 @@ impl Handler for Pptx {
                                 }
                             }
                         } else {
-                            canvas.stroke_rect(x, y, w, h, MUTED);
-                            canvas.draw_text("[chart]", x + 8.0, y + 20.0, 14.0, MUTED, false);
+                            let drawn = self
+                                .chart_space_for_frame(slide, e)
+                                .map(|space| {
+                                    crate::chartdraw::draw_chart(&mut canvas, &space, x, y, w, h)
+                                })
+                                .unwrap_or(false);
+                            if !drawn {
+                                canvas.stroke_rect(x, y, w, h, MUTED);
+                                canvas.draw_text("[chart]", x + 8.0, y + 20.0, 14.0, MUTED, false);
+                            }
                         }
                     }
                     _ => {
@@ -2621,6 +2737,8 @@ impl Handler for Pptx {
                                     .unwrap_or(default_text);
                                 let bold =
                                     rpr.map(|rp| rp.attr_local("b") == Some("1")).unwrap_or(false);
+                                let italic =
+                                    rpr.map(|rp| rp.attr_local("i") == Some("1")).unwrap_or(false);
                                 let text =
                                     r.child("t").map(|t| t.text_content()).unwrap_or_default();
                                 spans.push(Span {
@@ -2628,6 +2746,7 @@ impl Handler for Pptx {
                                     size: size_pt * px_per_pt,
                                     color,
                                     bold,
+                                    italic,
                                 });
                             }
                             if spans.is_empty() {
@@ -2639,7 +2758,7 @@ impl Handler for Pptx {
                                 let size = spans.first().map(|s| s.size).unwrap_or(18.0);
                                 let color = spans.first().map(|s| s.color).unwrap_or(default_text);
                                 extra_indent = size * 1.2 * list_level as f32;
-                                spans.insert(0, Span { text: marker, size, color, bold: false });
+                                spans.insert(0, Span { text: marker, size, color, bold: false, italic: false });
                             }
                             let max_size = spans.iter().map(|s| s.size).fold(12.0f32, f32::max);
                             let line_h = max_size * 1.25;
@@ -2968,15 +3087,16 @@ mod tests {
 
     #[test]
     fn color_mods_approximate_office() {
-        // accent1 4472C4 at lumMod 75% (as PowerPoint's "darker 25%").
+        // accent1 4472C4 at lumMod 75% — PowerPoint's "Darker 25%" is
+        // 2F5496; HSL luminance math lands within a hair of it.
         let mut clr = el("a:schemeClr", &[("val", "accent1")]);
         clr.push(el("a:lumMod", &[("val", "75000")]));
-        assert_eq!(apply_color_mods("4472C4", &clr), "335593");
-        // lumMod 60% + lumOff 40% (a "lighter 40%" variant).
+        assert_eq!(apply_color_mods("4472C4", &clr), "2F5597");
+        // lumMod 60% + lumOff 40% — PowerPoint's "Lighter 40%" is 8EAADB.
         let mut clr = el("a:schemeClr", &[("val", "accent1")]);
         clr.push(el("a:lumMod", &[("val", "60000")]));
         clr.push(el("a:lumOff", &[("val", "40000")]));
-        assert_eq!(apply_color_mods("4472C4", &clr), "8EAADB");
+        assert_eq!(apply_color_mods("4472C4", &clr), "8FAADC");
         // No mods pass through.
         assert_eq!(apply_color_mods("FF0000", &el("a:srgbClr", &[])), "FF0000");
     }

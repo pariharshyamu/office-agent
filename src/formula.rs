@@ -976,6 +976,108 @@ impl<'a> Evaluator<'a> {
                     Err(_) => Value::Err("#VALUE!".into()),
                 }
             }
+            "PROPER" => {
+                need!(1);
+                let t = arg_text!(0);
+                let mut out = String::with_capacity(t.len());
+                let mut cap = true;
+                for ch in t.chars() {
+                    if ch.is_alphanumeric() {
+                        if cap {
+                            out.extend(ch.to_uppercase());
+                        } else {
+                            out.extend(ch.to_lowercase());
+                        }
+                        cap = false;
+                    } else {
+                        out.push(ch);
+                        cap = true;
+                    }
+                }
+                Value::Text(out)
+            }
+            "FLOOR" | "CEILING" => {
+                need!(1);
+                let n = arg_num!(0);
+                let sig = if args.len() > 1 { arg_num!(1) } else { 1.0 };
+                if sig == 0.0 {
+                    return Value::Number(0.0);
+                }
+                if n > 0.0 && sig < 0.0 {
+                    return Value::Err("#NUM!".into());
+                }
+                let q = n / sig;
+                Value::Number(if name == "FLOOR" { q.floor() } else { q.ceil() } * sig)
+            }
+            "COUNTBLANK" => {
+                need!(1);
+                let (_, _, vals) = match self.range_grid(sheet, &args[0]) {
+                    Ok(g) => g,
+                    Err(e) => return e,
+                };
+                let blank = vals
+                    .iter()
+                    .filter(|v| matches!(v, Value::Empty) || matches!(v, Value::Text(t) if t.is_empty()))
+                    .count();
+                Value::Number(blank as f64)
+            }
+            "TEXTJOIN" => {
+                need!(3);
+                let delim = arg_text!(0);
+                let ignore_empty = match self.eval(sheet, &args[1]).as_bool() {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                let mut vals = Vec::new();
+                for a in &args[2..] {
+                    if let Err(e) = self.flatten(sheet, a, &mut vals) {
+                        return e;
+                    }
+                }
+                let mut parts = Vec::new();
+                for v in vals {
+                    if let Value::Err(_) = v {
+                        return v;
+                    }
+                    let t = v.as_text();
+                    if !(ignore_empty && t.is_empty()) {
+                        parts.push(t);
+                    }
+                }
+                Value::Text(parts.join(&delim))
+            }
+            "SUMPRODUCT" => {
+                need!(1);
+                let mut dims: Option<(usize, usize)> = None;
+                let mut grids: Vec<Vec<Value>> = Vec::new();
+                for a in args {
+                    let (w, h, vals) = match self.range_grid(sheet, a) {
+                        Ok(g) => g,
+                        Err(e) => return e,
+                    };
+                    match dims {
+                        None => dims = Some((w, h)),
+                        Some(d) if d != (w, h) => {
+                            return Value::Err("#VALUE! (ranges differ in size)".into())
+                        }
+                        _ => {}
+                    }
+                    grids.push(vals);
+                }
+                let n = grids.first().map(|g| g.len()).unwrap_or(0);
+                let mut total = 0.0;
+                for i in 0..n {
+                    let mut product = 1.0;
+                    for g in &grids {
+                        match &g[i] {
+                            Value::Err(e) => return Value::Err(e.clone()),
+                            v => product *= v.as_number().unwrap_or(0.0),
+                        }
+                    }
+                    total += product;
+                }
+                Value::Number(total)
+            }
             "SUMIF" | "COUNTIF" | "AVERAGEIF" => {
                 need!(2);
                 let (w, h, crit_vals) = match self.range_grid(sheet, &args[0]) {
@@ -1277,6 +1379,24 @@ mod tests {
         assert_eq!(eval("=IFERROR(1/0,\"oops\")"), Value::Text("oops".into()));
         assert_eq!(eval("=ROUND(2.345,2)"), Value::Number(2.35));
         assert_eq!(eval("=YEAR(DATE(2026,7,11))"), Value::Number(2026.0));
+    }
+
+    #[test]
+    fn v05_functions() {
+        // A1:A3 = 10/20/30 times B-column (only B1 = A1*2 = 20 is numeric).
+        assert_eq!(eval("=SUMPRODUCT(A1:A3,A1:A3)"), Value::Number(1400.0));
+        assert_eq!(eval("=FLOOR(7.7)"), Value::Number(7.0));
+        assert_eq!(eval("=CEILING(7.1,0.5)"), Value::Number(7.5));
+        assert_eq!(eval("=COUNTBLANK(A1:A5)"), Value::Number(1.0));
+        assert_eq!(
+            eval("=TEXTJOIN(\"-\",TRUE,A1,A2)"),
+            Value::Text("10-20".into())
+        );
+        assert_eq!(eval("=PROPER(\"hello world\")"), Value::Text("Hello World".into()));
+        assert_eq!(
+            eval("=SUMPRODUCT(A1:A2,A1:A3)"),
+            Value::Err("#VALUE! (ranges differ in size)".into())
+        );
     }
 
     #[test]

@@ -53,6 +53,8 @@ pub struct Span {
     pub size: f32,
     pub color: Color,
     pub bold: bool,
+    /// Rendered as a synthetic oblique (sheared upright glyphs).
+    pub italic: bool,
 }
 
 pub struct Canvas {
@@ -118,6 +120,65 @@ impl Canvas {
         );
     }
 
+    /// Filled polygon with anti-aliasing (chart slices, wedges).
+    pub fn fill_polygon(&mut self, pts: &[(f32, f32)], color: Color) {
+        if pts.len() < 3 {
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(pts[0].0, pts[0].1);
+        for p in &pts[1..] {
+            pb.line_to(p.0, p.1);
+        }
+        pb.close();
+        let Some(path) = pb.finish() else { return };
+        let mut paint = Paint::default();
+        paint.set_color(color.skia());
+        paint.anti_alias = true;
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    /// Filled circle (chart markers).
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
+        let mut pb = PathBuilder::new();
+        pb.push_circle(cx, cy, r.max(0.5));
+        let Some(path) = pb.finish() else { return };
+        let mut paint = Paint::default();
+        paint.set_color(color.skia());
+        paint.anti_alias = true;
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    /// Anti-aliased line with a stroke width (chart lines).
+    pub fn thick_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Color) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(x0, y0);
+        pb.line_to(x1, y1);
+        let Some(path) = pb.finish() else { return };
+        let mut paint = Paint::default();
+        paint.set_color(color.skia());
+        paint.anti_alias = true;
+        self.pixmap.stroke_path(
+            &path,
+            &paint,
+            &Stroke { width, ..Stroke::default() },
+            Transform::identity(),
+            None,
+        );
+    }
+
     fn font(&self, bold: bool) -> &FontRef<'static> {
         if bold {
             &self.bold
@@ -143,6 +204,22 @@ impl Canvas {
 
     /// Draw one line of text with `y` as the baseline. Returns the advance.
     pub fn draw_text(&mut self, text: &str, x: f32, y: f32, size_px: f32, color: Color, bold: bool) -> f32 {
+        self.draw_text_styled(text, x, y, size_px, color, bold, false)
+    }
+
+    /// `draw_text` with synthetic italics: an oblique shear of ~12° applied
+    /// per pixel row (the embedded fonts have no italic faces).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_styled(
+        &mut self,
+        text: &str,
+        x: f32,
+        y: f32,
+        size_px: f32,
+        color: Color,
+        bold: bool,
+        italic: bool,
+    ) -> f32 {
         let font = self.font(bold).clone();
         let scaled = font.as_scaled(PxScale::from(size_px));
         let mut caret = x;
@@ -158,8 +235,13 @@ impl Canvas {
                 let bounds = outlined.px_bounds();
                 let data = self.pixmap.pixels_mut();
                 outlined.draw(|gx, gy, cov| {
-                    let px = bounds.min.x as i32 + gx as i32;
                     let py = bounds.min.y as i32 + gy as i32;
+                    let shear = if italic {
+                        ((y - py as f32) * 0.21) as i32
+                    } else {
+                        0
+                    };
+                    let px = bounds.min.x as i32 + gx as i32 + shear;
                     if px < 0 || py < 0 || px >= width || py >= height || cov <= 0.0 {
                         return;
                     }
@@ -214,7 +296,12 @@ impl Canvas {
                     }
                     let matches_last = cur
                         .last()
-                        .map(|l| l.size == span.size && l.color == span.color && l.bold == span.bold)
+                        .map(|l| {
+                            l.size == span.size
+                                && l.color == span.color
+                                && l.bold == span.bold
+                                && l.italic == span.italic
+                        })
                         .unwrap_or(false);
                     if matches_last {
                         let last = cur.last_mut().unwrap();
@@ -231,6 +318,7 @@ impl Canvas {
                             size: span.size,
                             color: span.color,
                             bold: span.bold,
+                            italic: span.italic,
                         });
                         cur_w += word_w;
                     }
@@ -251,14 +339,23 @@ impl Canvas {
     pub fn draw_spans_line(&mut self, line: &[Span], x: f32, baseline: f32) {
         let mut caret = x;
         for span in line {
-            caret += self.draw_text(&span.text, caret, baseline, span.size, span.color, span.bold);
+            caret += self.draw_text_styled(
+                &span.text,
+                caret,
+                baseline,
+                span.size,
+                span.color,
+                span.bold,
+                span.italic,
+            );
         }
     }
 
-    /// Composite PNG bytes into the given rectangle (scaled to fit exactly).
-    /// Non-PNG bytes draw a placeholder. Returns whether the image decoded.
+    /// Composite image bytes (PNG, JPEG, or GIF first frame) into the given
+    /// rectangle, scaled to fit exactly. Undecodable bytes draw a
+    /// placeholder. Returns whether the image decoded.
     pub fn draw_image(&mut self, bytes: &[u8], x: f32, y: f32, w: f32, h: f32) -> bool {
-        if let Ok(img) = Pixmap::decode_png(bytes) {
+        if let Some(img) = decode_image(bytes) {
             let sx = w / img.width() as f32;
             let sy = h / img.height() as f32;
             let transform = Transform::from_scale(sx, sy).post_translate(x, y);
@@ -266,7 +363,7 @@ impl Canvas {
                 .draw_pixmap(0, 0, img.as_ref(), &PixmapPaint::default(), transform, None);
             return true;
         }
-        // JPEG/GIF placeholder: framed light box with a label.
+        // Placeholder: framed light box with a label.
         self.fill_rect(x, y, w, h, Color { r: 0xEE, g: 0xEE, b: 0xEE });
         self.stroke_rect(x, y, w, h, GRID);
         let label = "[image]";
@@ -286,4 +383,95 @@ impl Canvas {
     pub fn png(&self) -> Result<Vec<u8>> {
         self.pixmap.encode_png().context("cannot encode PNG")
     }
+}
+
+/// Sniff and decode PNG, JPEG, or GIF (first frame) into a Pixmap.
+fn decode_image(bytes: &[u8]) -> Option<Pixmap> {
+    if bytes.starts_with(b"\x89PNG") {
+        return Pixmap::decode_png(bytes).ok();
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return decode_jpeg(bytes);
+    }
+    if bytes.starts_with(b"GIF8") {
+        return decode_gif(bytes);
+    }
+    Pixmap::decode_png(bytes).ok()
+}
+
+fn decode_jpeg(bytes: &[u8]) -> Option<Pixmap> {
+    use jpeg_decoder::PixelFormat;
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let (w, h) = (info.width as u32, info.height as u32);
+    let mut pm = Pixmap::new(w.max(1), h.max(1))?;
+    let out = pm.pixels_mut();
+    let n = (w * h) as usize;
+    let px = |r: u8, g: u8, b: u8| tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, 255);
+    match info.pixel_format {
+        PixelFormat::RGB24 => {
+            for i in 0..n.min(pixels.len() / 3) {
+                out[i] = px(pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2])?;
+            }
+        }
+        PixelFormat::L8 => {
+            for i in 0..n.min(pixels.len()) {
+                out[i] = px(pixels[i], pixels[i], pixels[i])?;
+            }
+        }
+        PixelFormat::L16 => {
+            for i in 0..n.min(pixels.len() / 2) {
+                let v = pixels[i * 2]; // high byte of big-endian L16
+                out[i] = px(v, v, v)?;
+            }
+        }
+        PixelFormat::CMYK32 => {
+            for i in 0..n.min(pixels.len() / 4) {
+                let (c, m, yv, k) = (
+                    pixels[i * 4] as u32,
+                    pixels[i * 4 + 1] as u32,
+                    pixels[i * 4 + 2] as u32,
+                    pixels[i * 4 + 3] as u32,
+                );
+                // Adobe-style inverted CMYK as produced by jpeg-decoder.
+                out[i] = px(
+                    (c * k / 255) as u8,
+                    (m * k / 255) as u8,
+                    (yv * k / 255) as u8,
+                )?;
+            }
+        }
+    }
+    Some(pm)
+}
+
+fn decode_gif(bytes: &[u8]) -> Option<Pixmap> {
+    let mut opts = gif::DecodeOptions::new();
+    opts.set_color_output(gif::ColorOutput::RGBA);
+    let mut reader = opts.read_info(std::io::Cursor::new(bytes)).ok()?;
+    let (gw, gh) = (reader.width() as u32, reader.height() as u32);
+    let mut pm = Pixmap::new(gw.max(1), gh.max(1))?;
+    let frame = reader.read_next_frame().ok()??;
+    let out = pm.pixels_mut();
+    for row in 0..frame.height as u32 {
+        for col in 0..frame.width as u32 {
+            let src = ((row * frame.width as u32 + col) * 4) as usize;
+            if src + 3 >= frame.buffer.len() {
+                continue;
+            }
+            let (tx, ty) = (frame.left as u32 + col, frame.top as u32 + row);
+            if tx >= gw || ty >= gh {
+                continue;
+            }
+            let c = tiny_skia::ColorU8::from_rgba(
+                frame.buffer[src],
+                frame.buffer[src + 1],
+                frame.buffer[src + 2],
+                frame.buffer[src + 3],
+            );
+            out[(ty * gw + tx) as usize] = c.premultiply();
+        }
+    }
+    Some(pm)
 }

@@ -16,6 +16,8 @@ pub enum ChartKind {
     Bar,
     Line,
     Pie,
+    /// XY scatter: each point is an (x, y) number pair on two value axes.
+    Scatter,
 }
 
 pub fn parse_kind(s: &str) -> Result<ChartKind> {
@@ -24,7 +26,8 @@ pub fn parse_kind(s: &str) -> Result<ChartKind> {
         "bar" | "bar-horizontal" => Ok(ChartKind::Bar),
         "line" => Ok(ChartKind::Line),
         "pie" => Ok(ChartKind::Pie),
-        other => bail!("unknown chart kind '{other}' (column/bar/line/pie)"),
+        "scatter" | "xy" => Ok(ChartKind::Scatter),
+        other => bail!("unknown chart kind '{other}' (column/bar/line/pie/scatter)"),
     }
 }
 
@@ -37,6 +40,10 @@ pub struct Series {
     pub cats_ref: Option<String>,
     pub vals: Vec<f64>,
     pub vals_ref: Option<String>,
+    /// Scatter-only x values (paired with `vals` as y). Empty for other
+    /// kinds; scatter falls back to 1..n when missing.
+    pub xs: Vec<f64>,
+    pub xs_ref: Option<String>,
 }
 
 fn c_val(name: &str, val: &str) -> XmlElement {
@@ -122,7 +129,8 @@ fn num_source(reference: &Option<String>, values: &[f64]) -> XmlElement {
     }
 }
 
-fn build_ser(idx: usize, series: &Series, line: bool) -> XmlElement {
+/// `c:ser` with idx/order/tx filled in — the part every chart kind shares.
+fn ser_header(idx: usize, series: &Series) -> XmlElement {
     let mut ser = XmlElement::new("c:ser");
     ser.push(c_val("c:idx", &idx.to_string()));
     ser.push(c_val("c:order", &idx.to_string()));
@@ -143,6 +151,11 @@ fn build_ser(idx: usize, series: &Series, line: bool) -> XmlElement {
         }
     }
     ser.push(tx);
+    ser
+}
+
+fn build_ser(idx: usize, series: &Series, line: bool) -> XmlElement {
+    let mut ser = ser_header(idx, series);
     if !series.cats.is_empty() {
         let mut cat = XmlElement::new("c:cat");
         cat.push(str_source(&series.cats_ref, &series.cats));
@@ -157,8 +170,48 @@ fn build_ser(idx: usize, series: &Series, line: bool) -> XmlElement {
     ser
 }
 
+/// Scatter series: marker-only points (no connecting line) with paired
+/// xVal/yVal number sources.
+fn build_scatter_ser(idx: usize, series: &Series) -> XmlElement {
+    let mut ser = ser_header(idx, series);
+    let mut sp = XmlElement::new("c:spPr");
+    let mut ln = XmlElement::new("a:ln");
+    ln.push(XmlElement::new("a:noFill"));
+    sp.push(ln);
+    ser.push(sp);
+    let xs: Vec<f64> = if series.xs.len() == series.vals.len() && !series.xs.is_empty() {
+        series.xs.clone()
+    } else {
+        (1..=series.vals.len()).map(|i| i as f64).collect()
+    };
+    let mut xv = XmlElement::new("c:xVal");
+    xv.push(num_source(&series.xs_ref, &xs));
+    ser.push(xv);
+    let mut yv = XmlElement::new("c:yVal");
+    yv.push(num_source(&series.vals_ref, &series.vals));
+    ser.push(yv);
+    ser.push(c_val("c:smooth", "0"));
+    ser
+}
+
 const AX_CAT: &str = "111111111";
 const AX_VAL: &str = "222222222";
+
+/// Scatter plots put value axes on both sides.
+fn build_scatter_axes() -> (XmlElement, XmlElement) {
+    let mk = |id: &str, pos: &str, cross: &str| {
+        let mut ax = XmlElement::new("c:valAx");
+        ax.push(c_val("c:axId", id));
+        let mut scaling = XmlElement::new("c:scaling");
+        scaling.push(c_val("c:orientation", "minMax"));
+        ax.push(scaling);
+        ax.push(c_val("c:delete", "0"));
+        ax.push(c_val("c:axPos", pos));
+        ax.push(c_val("c:crossAx", cross));
+        ax
+    };
+    (mk(AX_CAT, "b", AX_VAL), mk(AX_VAL, "l", AX_CAT))
+}
 
 fn build_axes(kind: ChartKind) -> (XmlElement, XmlElement) {
     // Horizontal bar charts flip the axis positions.
@@ -269,6 +322,20 @@ pub fn build_chart_space(
             pie.push(c_val("c:firstSliceAng", "0"));
             plot_area.push(pie);
         }
+        ChartKind::Scatter => {
+            let mut sc = XmlElement::new("c:scatterChart");
+            sc.push(c_val("c:scatterStyle", "lineMarker"));
+            sc.push(c_val("c:varyColors", "0"));
+            for (i, s) in series.iter().enumerate() {
+                sc.push(build_scatter_ser(i, s));
+            }
+            sc.push(c_val("c:axId", AX_CAT));
+            sc.push(c_val("c:axId", AX_VAL));
+            plot_area.push(sc);
+            let (x_ax, y_ax) = build_scatter_axes();
+            plot_area.push(x_ax);
+            plot_area.push(y_ax);
+        }
     }
     chart.push(plot_area);
 
@@ -281,6 +348,195 @@ pub fn build_chart_space(
     chart.push(c_val("c:plotVisOnly", "1"));
     space.push(chart);
     Ok(space)
+}
+
+/// 0-based column index to letters (0 = A).
+fn column_letters(mut c: u32) -> String {
+    let mut s = String::new();
+    loop {
+        s.insert(0, (b'A' + (c % 26) as u8) as char);
+        if c < 26 {
+            break;
+        }
+        c = c / 26 - 1;
+    }
+    s
+}
+
+fn wb_cell_str(r: &str, text: &str) -> XmlElement {
+    let mut c = el("c", &[("r", r), ("t", "inlineStr")]);
+    let mut is = XmlElement::new("is");
+    let mut t = XmlElement::new("t");
+    t.push_text(text);
+    is.push(t);
+    c.push(is);
+    c
+}
+
+fn wb_cell_num(r: &str, v: f64) -> XmlElement {
+    let mut c = el("c", &[("r", r)]);
+    let mut vv = XmlElement::new("v");
+    vv.push_text(&format_f64(v));
+    c.push(vv);
+    c
+}
+
+/// Build a real workbook holding the chart data (categories/x in column A,
+/// series in B..; names in row 1) and point every series' refs at it, so
+/// Office's "Edit Data" opens a live sheet. Returns the xlsx zip bytes;
+/// callers embed them and wire a `c:externalData` rel to the chart part.
+pub fn embedded_workbook(series: &mut [Series]) -> Result<Vec<u8>> {
+    let mut pkg = crate::templates::blank_package(crate::pkg::DocKind::Xlsx);
+    let mut sheet = pkg.xml("xl/worksheets/sheet1.xml")?;
+    let nrows = series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
+    let scatter = series.iter().any(|s| !s.xs.is_empty());
+    {
+        let Some(sd) = sheet.child_mut("sheetData") else {
+            bail!("workbook template is missing sheetData");
+        };
+        let mut hdr = el("row", &[("r", "1")]);
+        for (j, s) in series.iter().enumerate() {
+            hdr.push(wb_cell_str(
+                &format!("{}1", column_letters(j as u32 + 1)),
+                &s.name,
+            ));
+        }
+        sd.push(hdr);
+        for i in 0..nrows {
+            let rn = i + 2;
+            let mut row = el("row", &[("r", rn.to_string().as_str())]);
+            if scatter {
+                if let Some(x) = series.first().and_then(|s| s.xs.get(i)) {
+                    row.push(wb_cell_num(&format!("A{rn}"), *x));
+                }
+            } else if let Some(c) = series.first().and_then(|s| s.cats.get(i)) {
+                if !c.is_empty() {
+                    row.push(wb_cell_str(&format!("A{rn}"), c));
+                }
+            }
+            for (j, s) in series.iter().enumerate() {
+                if let Some(v) = s.vals.get(i) {
+                    row.push(wb_cell_num(
+                        &format!("{}{rn}", column_letters(j as u32 + 1)),
+                        *v,
+                    ));
+                }
+            }
+            sd.push(row);
+        }
+    }
+    pkg.put_xml("xl/worksheets/sheet1.xml", &sheet)?;
+
+    let last = nrows + 1;
+    for (j, s) in series.iter_mut().enumerate() {
+        let col = column_letters(j as u32 + 1);
+        s.name_ref = Some(format!("Sheet1!${col}$1"));
+        s.vals_ref = Some(format!("Sheet1!${col}$2:${col}${last}"));
+        if scatter {
+            s.xs_ref = Some(format!("Sheet1!$A$2:$A${last}"));
+        } else if !s.cats.is_empty() {
+            s.cats_ref = Some(format!("Sheet1!$A$2:$A${last}"));
+        }
+    }
+    pkg.to_zip_bytes()
+}
+
+/// Append `<c:externalData r:id/><c:autoUpdate 0/>` to a chartSpace,
+/// linking it to an embedded workbook relationship.
+pub fn attach_external_data(space: &mut XmlElement, rid: &str) {
+    let mut ext = el("c:externalData", &[("r:id", rid)]);
+    ext.push(c_val("c:autoUpdate", "0"));
+    space.push(ext);
+}
+
+/// Rels part content for a chart that references an embedded workbook.
+pub fn chart_rels_xml(embedding_target: &str) -> XmlElement {
+    let mut rels = el(
+        "Relationships",
+        &[("xmlns", "http://schemas.openxmlformats.org/package/2006/relationships")],
+    );
+    rels.push(el(
+        "Relationship",
+        &[
+            ("Id", "rId1"),
+            (
+                "Type",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package",
+            ),
+            ("Target", embedding_target),
+        ],
+    ));
+    rels
+}
+
+pub const XLSX_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+/// Parse inline chart data from props: `categories=A,B,C`, `values=1,2,3`,
+/// `series=Name`, plus `values2=`/`series2=`... for more series, and
+/// `xvalues=` (or numeric categories) for scatter. Shared by the pptx and
+/// docx handlers, which have no cell range to reference.
+pub fn inline_series(kind: ChartKind, props: &crate::props::Props) -> Result<Vec<Series>> {
+    let cats: Vec<String> = props
+        .get("categories")
+        .or_else(|| props.get("cats"))
+        .map(|c| c.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    let parse_vals = |raw: &str| -> Result<Vec<f64>> {
+        raw.split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<f64>()
+                    .map_err(|_| anyhow::anyhow!("'{}' is not a number in values", s.trim()))
+            })
+            .collect()
+    };
+    // Scatter charts read categories as numeric x values (or --prop
+    // xvalues=; plain x= stays the frame position).
+    let scatter = kind == ChartKind::Scatter;
+    let xs: Vec<f64> = if scatter {
+        props
+            .get("xvalues")
+            .map(parse_vals)
+            .transpose()?
+            .unwrap_or_else(|| {
+                cats.iter()
+                    .enumerate()
+                    .map(|(i, c)| c.parse::<f64>().unwrap_or((i + 1) as f64))
+                    .collect()
+            })
+    } else {
+        Vec::new()
+    };
+    let cats = if scatter { Vec::new() } else { cats };
+    let mut series = Vec::new();
+    let first = props
+        .get("values")
+        .ok_or_else(|| anyhow::anyhow!(
+            "chart needs --prop values=10,20,30 (and usually --prop categories=A,B,C)"
+        ))?;
+    series.push(Series {
+        name: props.get("series").unwrap_or("Series 1").to_string(),
+        cats: cats.clone(),
+        vals: parse_vals(first)?,
+        xs: xs.clone(),
+        ..Default::default()
+    });
+    let mut n = 2;
+    while let Some(vals) = props.get(&format!("values{n}")) {
+        series.push(Series {
+            name: props
+                .get(&format!("series{n}"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("Series {n}")),
+            cats: cats.clone(),
+            vals: parse_vals(vals)?,
+            xs: xs.clone(),
+            ..Default::default()
+        });
+        n += 1;
+    }
+    Ok(series)
 }
 
 pub const CHART_CONTENT_TYPE: &str =

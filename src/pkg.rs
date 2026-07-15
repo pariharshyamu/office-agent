@@ -81,7 +81,9 @@ impl Package {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Serialize the package to zip bytes (also used to embed a workbook
+    /// inside another package).
+    pub fn to_zip_bytes(&self) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
@@ -93,7 +95,11 @@ impl Package {
             }
             zip.finish()?;
         }
-        fs::write(path, cursor.into_inner())
+        Ok(cursor.into_inner())
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        fs::write(path, self.to_zip_bytes()?)
             .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(())
     }
@@ -129,6 +135,24 @@ impl Package {
 
     pub fn remove_part(&mut self, name: &str) {
         self.parts.remove(name);
+    }
+
+    /// Ensure `[Content_Types].xml` has a Default for an extension (e.g.
+    /// "xlsx" for embedded workbooks, "vml" for legacy drawings).
+    pub fn add_default(&mut self, extension: &str, content_type: &str) -> Result<()> {
+        let mut ct = self.xml("[Content_Types].xml")?;
+        let exists = ct
+            .children_named("Default")
+            .iter()
+            .any(|d| d.attr_local("Extension") == Some(extension));
+        if !exists {
+            ct.push(xml::el(
+                "Default",
+                &[("Extension", extension), ("ContentType", content_type)],
+            ));
+            self.put_xml("[Content_Types].xml", &ct)?;
+        }
+        Ok(())
     }
 
     /// Ensure `[Content_Types].xml` has an Override for `part`.

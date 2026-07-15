@@ -1007,3 +1007,197 @@ fn safety_rails() {
     let a1 = ok(&dir, &["get", "e.xlsx", "/Sheet1/A1", "--json"]);
     assert!(a1.contains("\"type\": \"empty\""), "atomic batch should have saved nothing: {a1}");
 }
+
+/// Read one zip entry of an OOXML package as text.
+fn zip_text(path: &Path, entry: &str) -> String {
+    use std::io::Read;
+    let bytes = std::fs::read(path).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut s = String::new();
+    zip.by_name(entry)
+        .unwrap_or_else(|_| panic!("missing zip entry {entry}"))
+        .read_to_string(&mut s)
+        .unwrap();
+    s
+}
+
+#[test]
+fn scatter_charts_and_docx_charts() {
+    let dir = temp_dir("v05charts");
+    // xlsx scatter: first column = x values.
+    ok(&dir, &["create", "sc.xlsx"]);
+    for (i, (x, y)) in [(1, 1), (2, 4), (3, 9)].iter().enumerate() {
+        ok(&dir, &["set", "sc.xlsx", &format!("/Sheet1/A{}", i + 1), "--prop", &format!("value={x}")]);
+        ok(&dir, &["set", "sc.xlsx", &format!("/Sheet1/B{}", i + 1), "--prop", &format!("value={y}")]);
+    }
+    ok(&dir, &[
+        "add", "sc.xlsx", "/Sheet1", "--type", "chart",
+        "--prop", "kind=scatter", "--prop", "data=A1:B3",
+    ]);
+    let chart = zip_text(&dir.join("sc.xlsx"), "xl/charts/chart1.xml");
+    assert!(chart.contains("<c:scatterChart>"), "{chart}");
+    assert!(chart.contains("<c:xVal>") && chart.contains("<c:yVal>"), "{chart}");
+    assert_eq!(chart.matches("<c:valAx>").count(), 2, "scatter needs two value axes");
+
+    // pptx scatter with explicit x values + embedded workbook (Edit Data).
+    ok(&dir, &["create", "p.pptx"]);
+    ok(&dir, &["add", "p.pptx", "/", "--type", "slide"]);
+    ok(&dir, &[
+        "add", "p.pptx", "/slide[1]", "--type", "chart",
+        "--prop", "kind=scatter", "--prop", "xvalues=1,2,4",
+        "--prop", "values=3,5,4", "--prop", "series=Trials",
+    ]);
+    let chart = zip_text(&dir.join("p.pptx"), "ppt/charts/chart1.xml");
+    assert!(chart.contains("<c:scatterChart>"), "{chart}");
+    assert!(chart.contains("c:externalData"), "chart should link its embedded workbook");
+    assert!(chart.contains("Sheet1!$B$2:$B$4"), "series should reference the workbook: {chart}");
+    let rels = zip_text(&dir.join("p.pptx"), "ppt/charts/_rels/chart1.xml.rels");
+    assert!(rels.contains("embeddings/Microsoft_Excel_Worksheet1.xlsx"), "{rels}");
+    let bytes = std::fs::read(dir.join("p.pptx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx").is_ok());
+
+    // docx inline chart.
+    ok(&dir, &["create", "c.docx"]);
+    ok(&dir, &[
+        "add", "c.docx", "/body", "--type", "chart",
+        "--prop", "kind=column", "--prop", "categories=Q1,Q2",
+        "--prop", "values=10,20", "--prop", "title=Revenue",
+    ]);
+    let doc = zip_text(&dir.join("c.docx"), "word/document.xml");
+    assert!(doc.contains("drawingml/2006/chart"), "{doc}");
+    let chart = zip_text(&dir.join("c.docx"), "word/charts/chart1.xml");
+    assert!(chart.contains("<c:barChart>") && chart.contains("Revenue"), "{chart}");
+    let bytes = std::fs::read(dir.join("c.docx")).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("word/embeddings/Microsoft_Excel_Worksheet1.xlsx").is_ok());
+}
+
+#[test]
+fn xlsx_cell_comments() {
+    let dir = temp_dir("v05comments");
+    ok(&dir, &["create", "c.xlsx"]);
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A1", "--prop", "value=Total"]);
+    let out = ok(&dir, &[
+        "set", "c.xlsx", "/Sheet1/B2",
+        "--prop", "comment=Check this figure", "--prop", "author=Reviewer",
+    ]);
+    assert!(out.contains("comment=Check this figure"), "{out}");
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/A1", "--prop", "comment=Header note"]);
+
+    let view = ok(&dir, &["view", "c.xlsx", "comments"]);
+    assert!(view.contains("Sheet1!B2 [Reviewer] Check this figure"), "{view}");
+    assert!(view.contains("Sheet1!A1 [officecli] Header note"), "{view}");
+
+    // The comments part, the VML note shapes, and the sheet hook all exist.
+    let comments = zip_text(&dir.join("c.xlsx"), "xl/comments1.xml");
+    assert!(comments.contains("Check this figure") && comments.contains("Reviewer"), "{comments}");
+    let vml = zip_text(&dir.join("c.xlsx"), "xl/drawings/vmlDrawing1.vml");
+    assert_eq!(vml.matches("ObjectType=\"Note\"").count(), 2, "{vml}");
+    let sheet = zip_text(&dir.join("c.xlsx"), "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("<legacyDrawing"), "{sheet}");
+
+    // dump replays comments.
+    let dump = ok(&dir, &["dump", "c.xlsx"]);
+    assert!(dump.contains("Header note"), "{dump}");
+
+    // Empty comment removes.
+    ok(&dir, &["set", "c.xlsx", "/Sheet1/B2", "--prop", "comment="]);
+    let view = ok(&dir, &["view", "c.xlsx", "comments"]);
+    assert!(!view.contains("Check this figure"), "{view}");
+    assert!(view.contains("Header note"), "{view}");
+}
+
+#[test]
+fn screenshots_draw_charts_and_decode_jpeg_gif() {
+    let dir = temp_dir("v05shots");
+    // A 4x4 red JPEG and GIF (generated fixtures, embedded as base64).
+    const JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCAAEAAQDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDj6KKK+BP3M//Z";
+    const GIF_B64: &str = "R0lGODdhBAAEAIEAAMg8HgAAAAAAAAAAACwAAAAABAAEAAAICQABCBxIsCCAgAA7";
+
+    // pptx chart screenshot: chart data renders instead of a placeholder.
+    ok(&dir, &["create", "p.pptx"]);
+    ok(&dir, &["add", "p.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "p.pptx", "/slide[1]", "--type", "chart",
+        "--prop", "kind=pie", "--prop", "categories=A,B", "--prop", "values=60,40",
+    ]);
+    ok(&dir, &["view", "p.pptx", "screenshot", "-o", "p.png"]);
+    let png = std::fs::read(dir.join("p.png"))
+        .or_else(|_| std::fs::read(dir.join("p-1.png")))
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+
+    // xlsx chart anchored on the grid.
+    ok(&dir, &["create", "g.xlsx"]);
+    ok(&dir, &["set", "g.xlsx", "/Sheet1/A1", "--prop", "value=5"]);
+    ok(&dir, &["set", "g.xlsx", "/Sheet1/A2", "--prop", "value=9"]);
+    ok(&dir, &[
+        "add", "g.xlsx", "/Sheet1", "--type", "chart",
+        "--prop", "kind=column", "--prop", "data=A1:A2",
+    ]);
+    ok(&dir, &["view", "g.xlsx", "screenshot", "-o", "g.png"]);
+    let png = std::fs::read(dir.join("g.png"))
+        .or_else(|_| std::fs::read(dir.join("g-1.png")))
+        .unwrap();
+    assert!(png.len() > 4000, "chart area should add pixels");
+
+    // docx: JPEG + GIF images and an italic run all render.
+    use base64::Engine;
+    let jpg = base64::engine::general_purpose::STANDARD.decode(JPEG_B64).unwrap();
+    let gif = base64::engine::general_purpose::STANDARD.decode(GIF_B64).unwrap();
+    std::fs::write(dir.join("pic.jpg"), &jpg).unwrap();
+    std::fs::write(dir.join("pic.gif"), &gif).unwrap();
+    ok(&dir, &["create", "m.docx"]);
+    ok(&dir, &["add", "m.docx", "/body", "--type", "image", "--prop", "src=pic.jpg"]);
+    ok(&dir, &["add", "m.docx", "/body", "--type", "image", "--prop", "src=pic.gif"]);
+    ok(&dir, &[
+        "add", "m.docx", "/body", "--type", "paragraph",
+        "--prop", "text=slanted", "--prop", "italic=true",
+    ]);
+    ok(&dir, &["view", "m.docx", "screenshot", "-o", "m.png"]);
+    let png = std::fs::read(dir.join("m.png"))
+        .or_else(|_| std::fs::read(dir.join("m-1.png")))
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+}
+
+#[test]
+fn fly_in_motion_animation() {
+    let dir = temp_dir("v05flyin");
+    ok(&dir, &["create", "a.pptx"]);
+    ok(&dir, &["add", "a.pptx", "/", "--type", "slide", "--prop", "title=T"]);
+    ok(&dir, &[
+        "add", "a.pptx", "/slide[1]", "--type", "shape",
+        "--prop", "text=Mover", "--prop", "x=1in", "--prop", "y=3in",
+    ]);
+    ok(&dir, &[
+        "set", "a.pptx", "/slide[1]/shape[2]",
+        "--prop", "animation=fly-in", "--prop", "direction=left",
+    ]);
+    let slide = zip_text(&dir.join("a.pptx"), "ppt/slides/slide1.xml");
+    assert!(slide.contains("presetID=\"2\""), "{slide}");
+    assert!(slide.contains("presetSubtype=\"8\""), "fromLeft subtype: {slide}");
+    assert!(slide.contains("0-#ppt_w/2") && slide.contains("#ppt_x"), "{slide}");
+    assert!(slide.contains("ppt_y"), "{slide}");
+    // Unknown directions are rejected.
+    let err = fails(&dir, &[
+        "set", "a.pptx", "/slide[1]/shape[2]",
+        "--prop", "animation=fly-in", "--prop", "direction=sideways",
+    ]);
+    assert!(err.contains("unknown direction"), "{err}");
+}
+
+#[test]
+fn formula_v05_functions() {
+    let dir = temp_dir("v05formula");
+    ok(&dir, &["create", "f.xlsx"]);
+    ok(&dir, &["add", "f.xlsx", "/Sheet1", "--type", "row", "--prop", "values=2,10"]);
+    ok(&dir, &["add", "f.xlsx", "/Sheet1", "--type", "row", "--prop", "values=3,20"]);
+    let out = ok(&dir, &["calc", "f.xlsx", "=SUMPRODUCT(A1:A2,B1:B2)"]);
+    assert!(out.trim().ends_with("80"), "{out}");
+    let out = ok(&dir, &["calc", "f.xlsx", "=TEXTJOIN(\"/\",TRUE,A1:A2)"]);
+    assert!(out.contains("2/3"), "{out}");
+    let out = ok(&dir, &["calc", "f.xlsx", "=CEILING(A2+0.1,0.5)"]);
+    assert!(out.contains("3.5"), "{out}");
+}

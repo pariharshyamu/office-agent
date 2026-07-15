@@ -235,6 +235,160 @@ impl Docx {
         Ok(p)
     }
 
+    /// Inline DrawingML chart: a chart part under word/charts/ referenced
+    /// from a wp:inline drawing. Data comes from props (categories/values/
+    /// series...) and is stored as cached literals, like pptx charts.
+    fn build_chart_paragraph(&mut self, props: &Props) -> Result<XmlElement> {
+        let kind = crate::chart::parse_kind(props.get("kind").unwrap_or("column"))?;
+        let mut series = crate::chart::inline_series(kind, props)?;
+        // Embed a real workbook with the data so "Edit Data" opens a sheet.
+        let workbook = crate::chart::embedded_workbook(&mut series)?;
+        let mut chart_space =
+            crate::chart::build_chart_space(kind, props.get("title"), &series)?;
+        crate::chart::attach_external_data(&mut chart_space, "rId1");
+        let chart_num = self
+            .pkg
+            .part_names()
+            .filter_map(|p| {
+                p.strip_prefix("word/charts/chart")
+                    .and_then(|s| s.strip_suffix(".xml"))
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let chart_part = format!("word/charts/chart{chart_num}.xml");
+        self.pkg.put_xml(&chart_part, &chart_space)?;
+        self.pkg
+            .add_override(&chart_part, crate::chart::CHART_CONTENT_TYPE)?;
+        let emb_part = format!("word/embeddings/Microsoft_Excel_Worksheet{chart_num}.xlsx");
+        self.pkg.put_raw(&emb_part, workbook);
+        self.pkg.add_default("xlsx", crate::chart::XLSX_CONTENT_TYPE)?;
+        self.pkg.put_xml(
+            &format!("word/charts/_rels/chart{chart_num}.xml.rels"),
+            &crate::chart::chart_rels_xml(&format!(
+                "../embeddings/Microsoft_Excel_Worksheet{chart_num}.xlsx"
+            )),
+        )?;
+        let rid = crate::media::add_relationship(
+            &mut self.rels,
+            crate::chart::CHART_REL_TYPE,
+            &format!("charts/chart{chart_num}.xml"),
+        );
+
+        let w = props
+            .get("w")
+            .or_else(|| props.get("width"))
+            .map(crate::props::parse_emu)
+            .transpose()?
+            .unwrap_or(5_486_400); // 6in
+        let h = props
+            .get("h")
+            .or_else(|| props.get("height"))
+            .map(crate::props::parse_emu)
+            .transpose()?
+            .unwrap_or(3_200_400); // 3.5in
+        let id = self.next_drawing_id();
+        let name = props
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Chart {chart_num}"));
+
+        let mut inline = el(
+            "wp:inline",
+            &[
+                ("distT", "0"),
+                ("distB", "0"),
+                ("distL", "0"),
+                ("distR", "0"),
+                (
+                    "xmlns:wp",
+                    "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+                ),
+            ],
+        );
+        inline.push(el(
+            "wp:extent",
+            &[("cx", w.to_string().as_str()), ("cy", h.to_string().as_str())],
+        ));
+        inline.push(el(
+            "wp:docPr",
+            &[("id", id.to_string().as_str()), ("name", name.as_str())],
+        ));
+        let mut graphic = el(
+            "a:graphic",
+            &[("xmlns:a", "http://schemas.openxmlformats.org/drawingml/2006/main")],
+        );
+        let mut gdata = el(
+            "a:graphicData",
+            &[("uri", "http://schemas.openxmlformats.org/drawingml/2006/chart")],
+        );
+        gdata.push(el(
+            "c:chart",
+            &[
+                ("xmlns:c", "http://schemas.openxmlformats.org/drawingml/2006/chart"),
+                (
+                    "xmlns:r",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                ),
+                ("r:id", rid.as_str()),
+            ],
+        ));
+        graphic.push(gdata);
+        inline.push(graphic);
+
+        let mut drawing = XmlElement::new("w:drawing");
+        drawing.push(inline);
+        let mut r = XmlElement::new("w:r");
+        r.push(drawing);
+        let mut p = XmlElement::new("w:p");
+        if let Some(align) = props.get("align") {
+            let (jc, _) = parse_align(align)?;
+            let mut ppr = XmlElement::new("w:pPr");
+            ppr.push(el("w:jc", &[("w:val", jc)]));
+            p.push(ppr);
+        }
+        p.push(r);
+        Ok(p)
+    }
+
+    /// (chartSpace, width_px, height_px) when the paragraph holds an inline
+    /// DrawingML chart — used by the screenshot renderer.
+    fn chart_in_paragraph(&self, p: &XmlElement) -> Option<(XmlElement, f32, f32)> {
+        fn find_drawing(e: &XmlElement) -> Option<&XmlElement> {
+            if e.local_name() == "drawing" {
+                return Some(e);
+            }
+            e.children
+                .iter()
+                .filter_map(|c| c.as_element())
+                .find_map(find_drawing)
+        }
+        let drawing = find_drawing(p)?;
+        let inline = drawing.child("inline").or_else(|| drawing.child("anchor"))?;
+        let rid = inline
+            .child("graphic")?
+            .child("graphicData")?
+            .child("chart")?
+            .attr_local("id")?;
+        let target = self
+            .rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Id") == Some(rid))?
+            .attr_local("Target")?
+            .to_string();
+        let part = target
+            .strip_prefix('/')
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("word/{target}"));
+        let space = self.pkg.xml(&part).ok()?;
+        let ext = inline.child("extent")?;
+        let w = ext.attr_local("cx")?.parse::<f64>().ok()? / 9525.0;
+        let h = ext.attr_local("cy")?.parse::<f64>().ok()? / 9525.0;
+        Some((space, w as f32, h as f32))
+    }
+
     fn next_drawing_id(&self) -> u64 {
         let mut max_id = 0;
         fn walk(e: &XmlElement, max_id: &mut u64) {
@@ -2135,6 +2289,12 @@ impl Handler for Docx {
                 }
                 self.build_image_paragraph(props)?
             }
+            "chart" => {
+                if !matches!(parent_local.as_str(), "body" | "tc") {
+                    bail!("charts can be added to /body or a table cell");
+                }
+                self.build_chart_paragraph(props)?
+            }
             "toc" => {
                 if parent_local != "body" {
                     bail!("a TOC is added to /body");
@@ -2170,7 +2330,7 @@ impl Handler for Docx {
                 link
             }
             other => bail!(
-                "unsupported docx element type '{other}' (paragraph/run/table/row/break/image/toc/field/comment/footnote)"
+                "unsupported docx element type '{other}' (paragraph/run/table/row/break/image/chart/toc/field/comment/footnote)"
             ),
         };
 
@@ -2473,6 +2633,23 @@ impl Handler for Docx {
                         y += ih + 8.0;
                         continue;
                     }
+                    // Embedded chart?
+                    if let Some((space, cw, ch)) = self.chart_in_paragraph(element) {
+                        let iw = cw.min(content_w).max(120.0);
+                        let ih = ch.min(page_h - 2.0 * margin).max(90.0);
+                        need!(ih);
+                        if crate::chartdraw::draw_chart(
+                            pages.last_mut().unwrap(),
+                            &space,
+                            margin,
+                            y,
+                            iw,
+                            ih,
+                        ) {
+                            y += ih + 8.0;
+                            continue;
+                        }
+                    }
                     let style = element
                         .child("pPr")
                         .and_then(|ppr| ppr.child("pStyle"))
@@ -2503,6 +2680,7 @@ impl Handler for Docx {
                             .unwrap_or(base_pt);
                         let bold = base_bold
                             || rpr.map(|rp| rp.child("b").is_some()).unwrap_or(false);
+                        let italic = rpr.map(|rp| rp.child("i").is_some()).unwrap_or(false);
                         let color = rpr
                             .and_then(|rp| rp.child("color"))
                             .and_then(|c| c.attr_local("val"))
@@ -2515,6 +2693,7 @@ impl Handler for Docx {
                                 size: size_pt * px_per_pt,
                                 color,
                                 bold,
+                                italic,
                             });
                         }
                     }
@@ -2530,6 +2709,7 @@ impl Handler for Docx {
                                 size: base_pt * px_per_pt,
                                 color: BLACK,
                                 bold: false,
+                                italic: false,
                             },
                         );
                     }

@@ -346,12 +346,23 @@ officecli add data.xlsx /Sheet1 --type chart \
 officecli add deck.pptx '/slide[1]' --type chart --prop kind=pie \
     --prop categories="East,West,North" --prop values="40,35,25" \
     --prop series="Share" --prop title="Regional share"
+
+# docx: inline chart in the document body
+officecli add report.docx /body --type chart --prop kind=line \
+    --prop categories="Jan,Feb,Mar" --prop values="5,7,6" --prop title=Trend
+
+# scatter: first data column (xlsx) or xvalues= (pptx/docx) is the x series
+officecli add data.xlsx /Sheet1 --type chart --prop kind=scatter --prop data=A1:B9
+officecli add deck.pptx '/slide[1]' --type chart --prop kind=scatter \
+    --prop xvalues="1,2,4,8" --prop values="3,5,4,9"
 ```
 
-Kinds: `column`, `bar`, `line`, `pie`. xlsx charts reference the cells (they
-update when the data changes); pptx charts carry their data as cached
-literals (add `values2=`/`series2=`, ... for more series). Charts parse
-cleanly in openpyxl/python-pptx and render in Office and LibreOffice.
+Kinds: `column`, `bar`, `line`, `pie`, `scatter`. xlsx charts reference the
+cells (they update when the data changes); pptx and docx charts carry their
+data as cached literals (add `values2=`/`series2=`, ... for more series)
+plus an embedded workbook, so Office's "Edit Data" opens a real sheet.
+Charts parse cleanly in openpyxl/python-pptx, render in Office and
+LibreOffice, and draw with real axes/series in `view screenshot`.
 
 ### Pivot summaries (xlsx)
 
@@ -389,19 +400,34 @@ The TOC is inserted as a dirty field with `updateFields` set, so Word
 populates it on open. Fields support `page`, `numpages`, `date`, `time`,
 `filename`, `author`, or raw `code="..."`.
 
+### Cell comments (xlsx)
+
+```bash
+officecli set data.xlsx /Sheet1/B2 --prop comment="Check this figure" --prop author=Reviewer
+officecli view data.xlsx comments
+officecli set data.xlsx /Sheet1/B2 --prop comment=      # empty removes it
+```
+
+Comments are written as classic notes — the comments part plus the legacy
+VML shape Excel requires to display them — and read back by openpyxl,
+`view comments`, and `dump`.
+
 ### Transitions and animations (pptx)
 
 ```bash
 officecli set deck.pptx '/slide[1]' --prop transition=push --prop direction=left \
     --prop speed=fast --prop advance=5s
 officecli set deck.pptx '/slide[1]/shape[2]' --prop animation=fade --prop duration=750ms
+officecli set deck.pptx '/slide[1]/shape[3]' --prop animation=fly-in \
+    --prop direction=left --prop duration=750ms
 ```
 
 Transitions: `fade`, `cut`, `push`, `wipe`, `dissolve`, `circle`, `diamond`,
 `plus`, `wedge`, `wheel`, `zoom`, `cover`, `pull`, `split`, `blinds`,
 `checker`, `comb`, `strips`, `newsflash`, `random`, `none`. Animations are
-click-triggered entrance effects (`appear`, `fade`, `wipe`) built as a
-standard `p:timing` tree.
+click-triggered entrance effects (`appear`, `fade`, `wipe`, and `fly-in`
+with `direction=left/right/top/bottom` built from ppt_x/ppt_y motion
+behaviors) in a standard `p:timing` tree.
 
 ### view html, view screenshot, watch, and dump
 
@@ -422,9 +448,10 @@ giving agents a genuine render-look-fix loop:
 officecli view deck.pptx screenshot -o deck.png
 ```
 
-The rendering is an approximation (positions, fills, text size/color/bold,
-PNG images; JPEG/GIF and charts appear as placeholders), designed to make
-layout problems visible rather than to be print-accurate.
+The rendering is an approximation (positions, fills, text size/color/bold/
+italic, PNG/JPEG/GIF images, and charts drawn from their cached data with
+axes, series colors, and legends), designed to make layout problems visible
+rather than to be print-accurate.
 
 `watch` serves the HTML view on localhost and auto-reloads the browser
 whenever the file changes on disk — edit with officecli in one terminal,
@@ -487,7 +514,8 @@ failure.
 **Word (.docx)** — paragraphs (text, style Normal/Title/Heading1–3, align),
 runs (bold/italic/underline/size/color/font/highlight), bulleted/numbered
 lists with nesting, hyperlinks, tables (create, add row, set cell text +
-formatting), page breaks, images, comments (add/list/remove), footnotes,
+formatting), page breaks, images, inline charts (column/bar/line/pie/scatter
+with an embedded editable workbook), comments (add/list/remove), footnotes,
 TOC and fields, headers/footers with page numbers, page setup (orientation/
 size/margins), copy, transparent `w:sdt` content controls, insert
 before/after/at index, whole-scope find/replace and find+format with run
@@ -495,15 +523,18 @@ splitting, outline/text/stats/html/comments/screenshot views.
 
 **Excel (.xlsx)** — cells created on demand via `set` (strings, numbers,
 booleans, real dates/times, formulas auto-detected by `=`), a built-in
-formula evaluator (~40 functions, `get --computed`/`calc`), number formats
-(percent/currency/custom codes), hyperlinks, CSV import/export, sort, merged
-cells, column widths and row heights, shared-string-aware reads, cell
-styling (bold/italic/underline/color/size/font/fill) through a styles-table
-manager, sheets (add/rename/remove/copy), rows and columns (insert/remove/
-copy with shifts and workbook-wide formula-reference rewriting), charts over
-live ranges, computed pivot summaries, ranges on `get`, `$Sheet:A1`
-addressing, find/replace over string cells, grid/outline/stats/html/
-screenshot views. Formulas are stored uncalculated with `fullCalcOnLoad` so
+formula evaluator (~45 functions incl. SUMPRODUCT/TEXTJOIN, `get
+--computed`/`calc`), number formats (percent/currency/custom codes),
+hyperlinks, cell comments (with the VML note shapes Excel needs to show
+them; `view comments`, `--prop comment=` to set, empty to remove), CSV
+import/export, sort, merged cells, column widths and row heights,
+shared-string-aware reads, cell styling (bold/italic/underline/color/size/
+font/fill) through a styles-table manager, sheets (add/rename/remove/copy),
+rows and columns (insert/remove/copy with shifts and workbook-wide
+formula-reference rewriting), charts over live ranges (column/bar/line/pie/
+scatter), computed pivot summaries, ranges on `get`, `$Sheet:A1` addressing,
+find/replace over string cells, grid/outline/stats/html/comments/screenshot
+views. Formulas are stored uncalculated with `fullCalcOnLoad` so
 Excel/LibreOffice recalculate on open.
 
 **PowerPoint (.pptx)** — slides (add with `title`/`background`/`notes`,
@@ -511,8 +542,10 @@ position with `--index/--before/--after`, copy with notes, remove with full
 relationship cleanup), textbox shapes (text, x/y/w/h in any length unit,
 size/color/bold/italic/font/align/fill/name/url, bullet/numbered lists with
 levels), tables (CSV-shaped data, styled header, editable cells), speaker
-notes, images, charts, slide transitions, entrance animations, theme-color
-resolution (schemeClr + lumMod/lumOff), shape addressing by position,
+notes, images, charts (column/bar/line/pie/scatter, each with an embedded
+workbook so PowerPoint's "Edit Data" opens a live sheet), slide transitions,
+entrance animations incl. directional fly-in motion, theme-color resolution
+(schemeClr + HSL-based lumMod/lumOff), shape addressing by position,
 `@name=`, or `@id=`, slide background, find/replace across slides,
 outline/text/stats/html/notes/screenshot views.
 
@@ -526,20 +559,21 @@ Excel, PowerPoint, and LibreOffice, and parse with `python-docx`,
 ## Known limitations vs upstream OfficeCLI
 
 This is a focused port, not a feature-complete clone. Honest edges of the
-implemented features: `view screenshot` is an approximation (PNG images
-composite; JPEG/GIF and charts render as placeholders; no italics or
-justified text); the formula evaluator covers ~40 common functions but not
-the full Excel library, and dates compute against the 1900 date system only;
-pivots are computed summary tables, not native interactive PivotTables; pptx
-charts embed cached data without a linked workbook, so PowerPoint's "Edit
-Data" won't open a sheet; animations cover click-triggered entrance effects
-only; theme-color transforms (lumMod/lumOff/tint/shade) are per-channel
-approximations of Office's HSL math; `dump` is a high-fidelity content
-replay, not a byte-identical round-trip. Not implemented: scatter charts,
-docx charts, xlsx cell comments, array formulas, and PowerPoint motion-path
-animations. The architecture (lossless XML DOM over the zip package, one
-handler per format behind a common trait) is designed so these can be added
-incrementally.
+implemented features: `view screenshot` is an approximation — PNG/JPEG/GIF
+images composite and charts draw from their cached data with axes, series
+colors, and legends, but it is not a print-accurate Office renderer (italics
+are synthetic obliques; justified text renders left-aligned); the formula
+evaluator covers ~45 common functions but not the full Excel library, array
+formulas, or the 1904 date system; pivots are computed summary tables, not
+native interactive PivotTables; xlsx cell comments are classic notes (with
+VML shapes), not threaded comments; animations cover click-triggered
+entrance effects (appear/fade/wipe/fly-in) — custom motion paths beyond the
+directional fly-in are not built; theme-color lumMod/lumOff transforms use
+HSL luminance like Office (within a rounding hair of PowerPoint's palette),
+while tint/shade remain linear blends; `dump` is a high-fidelity content
+replay, not a byte-identical round-trip. The architecture (lossless XML DOM
+over the zip package, one handler per format behind a common trait) is
+designed so the remaining gaps can be added incrementally.
 
 ## Architecture
 
@@ -555,8 +589,11 @@ src/
   query.rs      CSS-like selector parser + NodeInfo-tree matcher
   media.rs      image sniffing (PNG/JPEG/GIF) + package bookkeeping
   html.rs       escaping + page shell for `view html`
-  render.rs     PNG canvas (tiny-skia + ab_glyph + embedded DejaVu Sans)
-  chart.rs      DrawingML chartSpace builder (xlsx + pptx charts)
+  render.rs     PNG canvas (tiny-skia + ab_glyph + embedded DejaVu Sans;
+                decodes PNG/JPEG/GIF, synthetic italics)
+  chart.rs      DrawingML chartSpace builder + embedded data workbooks
+                (docx + xlsx + pptx charts)
+  chartdraw.rs  chart rasterizer for screenshots (bar/line/pie/scatter)
   formula.rs    spreadsheet formula tokenizer / parser / evaluator
   diff.rs       content-level document comparison (NodeInfo trees)
   mcp.rs        Model Context Protocol server (stdio JSON-RPC)

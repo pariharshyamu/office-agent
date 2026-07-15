@@ -168,6 +168,56 @@ impl Xlsx {
     }
 
     /// Used range of a sheet: ((min_col,min_row),(max_col,max_row)) 0-based.
+    /// (from_col, from_row, to_col, to_row, chartSpace) for every chart
+    /// anchored on the sheet's drawing part — 0-based cell coordinates,
+    /// used by the screenshot renderer.
+    fn sheet_chart_anchors(&self, sheet: &Sheet) -> Vec<(u32, u32, u32, u32, XmlElement)> {
+        let mut out = Vec::new();
+        let rels_part = sheet.part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        if !self.pkg.has_part(&rels_part) {
+            return out;
+        }
+        let Ok(rels) = self.pkg.xml(&rels_part) else { return out };
+        let Some(rid) = sheet
+            .xml
+            .child("drawing")
+            .and_then(|d| d.attr("r:id").or_else(|| d.attr_local("id")))
+        else {
+            return out;
+        };
+        let Some(target) = rel_target(&rels, rid) else { return out };
+        let drawing_part = resolve_target("xl/worksheets", &target);
+        let Ok(drawing) = self.pkg.xml(&drawing_part) else { return out };
+        let drawing_rels_part = drawing_part.replace("xl/drawings/", "xl/drawings/_rels/") + ".rels";
+        let Ok(drels) = self.pkg.xml(&drawing_rels_part) else { return out };
+        for anchor in drawing.children_named("twoCellAnchor") {
+            let cell = |tag: &str| -> Option<(u32, u32)> {
+                let e = anchor.child(tag)?;
+                Some((
+                    e.child("col")?.text_content().trim().parse().ok()?,
+                    e.child("row")?.text_content().trim().parse().ok()?,
+                ))
+            };
+            let (Some((fc, fr)), Some((tc, tr))) = (cell("from"), cell("to")) else {
+                continue;
+            };
+            let Some(chart_rid) = anchor
+                .child("graphicFrame")
+                .and_then(|f| f.child("graphic"))
+                .and_then(|g| g.child("graphicData"))
+                .and_then(|d| d.child("chart"))
+                .and_then(|c| c.attr_local("id"))
+            else {
+                continue;
+            };
+            let Some(t) = rel_target(&drels, chart_rid) else { continue };
+            if let Ok(space) = self.pkg.xml(&resolve_target("xl/drawings", &t)) {
+                out.push((fc, fr, tc, tr, space));
+            }
+        }
+        out
+    }
+
     fn used_range(sheet: &Sheet) -> Option<((u32, u32), (u32, u32))> {
         let sheet_data = sheet.xml.child("sheetData")?;
         let mut range: Option<((u32, u32), (u32, u32))> = None;
@@ -491,11 +541,25 @@ impl Xlsx {
         }
 
         // Single-column ranges are a bare value series; wider ranges use the
-        // first column as categories.
+        // first column as categories (scatter: as numeric x values).
         let (cat_col, first_val_col) = if c0 == c1 { (None, c0) } else { (Some(c0), c0 + 1) };
+        let scatter = kind == crate::chart::ChartKind::Scatter;
         let cats: Vec<String> = match cat_col {
-            Some(cc) => (data_r0..=r1).map(|r| self.value_at(src_idx, cc, r)).collect(),
-            None => Vec::new(),
+            Some(cc) if !scatter => {
+                (data_r0..=r1).map(|r| self.value_at(src_idx, cc, r)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let xs: Vec<f64> = match cat_col {
+            Some(cc) if scatter => (data_r0..=r1)
+                .enumerate()
+                .map(|(i, r)| {
+                    self.value_at(src_idx, cc, r)
+                        .parse::<f64>()
+                        .unwrap_or((i + 1) as f64)
+                })
+                .collect(),
+            _ => Vec::new(),
         };
         let cats_ref = cat_col.map(|cc| self.abs_ref(src_idx, cc, data_r0, cc, r1));
 
@@ -514,9 +578,11 @@ impl Xlsx {
                 name,
                 name_ref: has_headers.then(|| self.abs_ref(src_idx, col, r0, col, r0)),
                 cats: cats.clone(),
-                cats_ref: cats_ref.clone(),
+                cats_ref: if scatter { None } else { cats_ref.clone() },
                 vals,
                 vals_ref: Some(self.abs_ref(src_idx, col, data_r0, col, r1)),
+                xs: xs.clone(),
+                xs_ref: if scatter { cats_ref.clone() } else { None },
             });
         }
         let chart_space =
@@ -860,6 +926,320 @@ impl Xlsx {
             &[("ref", target.as_str()), ("r:id", rid.as_str())],
         ));
         Ok(())
+    }
+
+    /// Set (or replace) a cell comment. Writes the comments part plus the
+    /// legacy VML note shape Excel needs to actually display it.
+    fn set_cell_comment(
+        &mut self,
+        sheet_idx: usize,
+        col: u32,
+        row0: u32,
+        text: &str,
+        author: &str,
+    ) -> Result<()> {
+        let sheet_part = self.sheets[sheet_idx].part.clone();
+        let sheet_rels_part = sheet_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        let mut sheet_rels = if self.pkg.has_part(&sheet_rels_part) {
+            self.pkg.xml(&sheet_rels_part)?
+        } else {
+            crate::xml::parse(EMPTY_RELS_XML.as_bytes())?
+        };
+
+        // Comments part: reuse the sheet's existing one or allocate the next.
+        let existing = sheet_rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Type") == Some(COMMENTS_REL_TYPE))
+            .and_then(|r| r.attr_local("Target"))
+            .map(|t| resolve_target("xl/worksheets", t));
+        let (comments_part, mut comments) = match existing {
+            Some(p) => {
+                let xml = self.pkg.xml(&p)?;
+                (p, xml)
+            }
+            None => {
+                let n = self
+                    .pkg
+                    .part_names()
+                    .filter_map(|p| {
+                        p.strip_prefix("xl/comments")
+                            .and_then(|s| s.strip_suffix(".xml"))
+                            .and_then(|n| n.parse::<u32>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let part = format!("xl/comments{n}.xml");
+                crate::media::add_relationship(
+                    &mut sheet_rels,
+                    COMMENTS_REL_TYPE,
+                    &format!("../comments{n}.xml"),
+                );
+                self.pkg.add_override(&part, COMMENTS_CONTENT_TYPE)?;
+                let mut root = el(
+                    "comments",
+                    &[("xmlns", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")],
+                );
+                root.push(XmlElement::new("authors"));
+                root.push(XmlElement::new("commentList"));
+                (part, root)
+            }
+        };
+
+        let authors = comments.ensure_child("authors", "authors", false);
+        let author_id = match authors
+            .children_named("author")
+            .iter()
+            .position(|a| a.text_content() == author)
+        {
+            Some(i) => i,
+            None => {
+                let mut a = XmlElement::new("author");
+                a.push_text(author);
+                authors.push(a);
+                authors.children_named("author").len() - 1
+            }
+        };
+
+        let ref_name = cell_name(col, row0);
+        let list = comments.ensure_child("commentList", "commentList", false);
+        list.children.retain(|n| {
+            !matches!(n, XmlNode::Element(e)
+                if e.local_name() == "comment" && e.attr_local("ref") == Some(ref_name.as_str()))
+        });
+        let mut cm = el(
+            "comment",
+            &[("ref", ref_name.as_str()), ("authorId", author_id.to_string().as_str())],
+        );
+        let mut text_el = XmlElement::new("text");
+        let mut run = XmlElement::new("r");
+        let mut t = el("t", &[("xml:space", "preserve")]);
+        t.push_text(text);
+        run.push(t);
+        text_el.push(run);
+        cm.push(text_el);
+        list.push(cm);
+        self.pkg.put_xml(&comments_part, &comments)?;
+
+        // VML note shape (hidden until hover), one per commented cell.
+        let vml_existing = sheet_rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Type") == Some(VML_REL_TYPE))
+            .and_then(|r| Some((r.attr_local("Id")?.to_string(), r.attr_local("Target")?.to_string())));
+        let (vml_part, vml_rid, mut vml) = match vml_existing {
+            Some((rid, target)) => {
+                let part = resolve_target("xl/worksheets", &target);
+                let xml = self.pkg.xml(&part)?;
+                (part, rid, xml)
+            }
+            None => {
+                let n = self
+                    .pkg
+                    .part_names()
+                    .filter_map(|p| {
+                        p.strip_prefix("xl/drawings/vmlDrawing")
+                            .and_then(|s| s.strip_suffix(".vml"))
+                            .and_then(|n| n.parse::<u32>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let part = format!("xl/drawings/vmlDrawing{n}.vml");
+                let rid = crate::media::add_relationship(
+                    &mut sheet_rels,
+                    VML_REL_TYPE,
+                    &format!("../drawings/vmlDrawing{n}.vml"),
+                );
+                self.pkg.add_default("vml", VML_CONTENT_TYPE)?;
+                let mut root = el(
+                    "xml",
+                    &[
+                        ("xmlns:v", "urn:schemas-microsoft-com:vml"),
+                        ("xmlns:o", "urn:schemas-microsoft-com:office:office"),
+                        ("xmlns:x", "urn:schemas-microsoft-com:office:excel"),
+                    ],
+                );
+                let mut layout = el("o:shapelayout", &[("v:ext", "edit")]);
+                layout.push(el("o:idmap", &[("v:ext", "edit"), ("data", "1")]));
+                root.push(layout);
+                let mut st = el(
+                    "v:shapetype",
+                    &[
+                        ("id", "_x0000_t202"),
+                        ("coordsize", "21600,21600"),
+                        ("o:spt", "202"),
+                        ("path", "m,l,21600r21600,l21600,xe"),
+                    ],
+                );
+                st.push(el("v:stroke", &[("joinstyle", "miter")]));
+                st.push(el("v:path", &[("gradientshapeok", "t"), ("o:connecttype", "rect")]));
+                root.push(st);
+                (part, rid, root)
+            }
+        };
+        let row_s = row0.to_string();
+        let col_s = col.to_string();
+        vml.children.retain(|n| {
+            !matches!(n, XmlNode::Element(e)
+                if e.local_name() == "shape"
+                    && e.child("ClientData").map(|cd| {
+                        cd.child("Row").map(|r| r.text_content().trim() == row_s).unwrap_or(false)
+                            && cd.child("Column").map(|c| c.text_content().trim() == col_s).unwrap_or(false)
+                    }).unwrap_or(false))
+        });
+        let max_id = vml
+            .children_named("shape")
+            .iter()
+            .filter_map(|s| {
+                s.attr_local("id")?
+                    .strip_prefix("_x0000_s")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(1024);
+        let sid = format!("_x0000_s{}", max_id + 1);
+        let mut shape = el(
+            "v:shape",
+            &[
+                ("id", sid.as_str()),
+                ("type", "#_x0000_t202"),
+                (
+                    "style",
+                    "position:absolute;margin-left:80pt;margin-top:2pt;width:108pt;height:60pt;z-index:1;visibility:hidden",
+                ),
+                ("fillcolor", "#ffffe1"),
+                ("o:insetmode", "auto"),
+            ],
+        );
+        shape.push(el("v:fill", &[("color2", "#ffffe1")]));
+        shape.push(el("v:shadow", &[("on", "t"), ("color", "black"), ("obscured", "t")]));
+        shape.push(el("v:path", &[("o:connecttype", "none")]));
+        shape.push(el("v:textbox", &[("style", "mso-direction-alt:auto")]));
+        let mut cd = el("x:ClientData", &[("ObjectType", "Note")]);
+        cd.push(XmlElement::new("x:MoveWithCells"));
+        cd.push(XmlElement::new("x:SizeWithCells"));
+        let mut anchor = XmlElement::new("x:Anchor");
+        anchor.push_text(&format!(
+            "{}, 15, {}, 2, {}, 15, {}, 2",
+            col + 1,
+            row0,
+            col + 3,
+            row0 + 4
+        ));
+        cd.push(anchor);
+        let mut autofill = XmlElement::new("x:AutoFill");
+        autofill.push_text("False");
+        cd.push(autofill);
+        let mut r_el = XmlElement::new("x:Row");
+        r_el.push_text(&row_s);
+        cd.push(r_el);
+        let mut c_el = XmlElement::new("x:Column");
+        c_el.push_text(&col_s);
+        cd.push(c_el);
+        shape.push(cd);
+        vml.push(shape);
+        self.pkg.put_xml(&vml_part, &vml)?;
+        self.pkg.put_xml(&sheet_rels_part, &sheet_rels)?;
+
+        let sheet_xml = &mut self.sheets[sheet_idx].xml;
+        if sheet_xml.attr("xmlns:r").is_none() {
+            sheet_xml.set_attr(
+                "xmlns:r",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            );
+        }
+        let ld = worksheet_child(sheet_xml, "legacyDrawing");
+        ld.set_attr("r:id", &vml_rid);
+        Ok(())
+    }
+
+    /// Delete a cell's comment (and its VML note shape); no-op when absent.
+    fn remove_cell_comment(&mut self, sheet_idx: usize, col: u32, row0: u32) -> Result<()> {
+        let sheet_part = self.sheets[sheet_idx].part.clone();
+        let sheet_rels_part = sheet_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        if !self.pkg.has_part(&sheet_rels_part) {
+            return Ok(());
+        }
+        let sheet_rels = self.pkg.xml(&sheet_rels_part)?;
+        let find = |rel_type: &str| -> Option<String> {
+            sheet_rels
+                .children_named("Relationship")
+                .into_iter()
+                .find(|r| r.attr_local("Type") == Some(rel_type))
+                .and_then(|r| r.attr_local("Target"))
+                .map(|t| resolve_target("xl/worksheets", t))
+        };
+        let ref_name = cell_name(col, row0);
+        if let Some(part) = find(COMMENTS_REL_TYPE) {
+            let mut comments = self.pkg.xml(&part)?;
+            if let Some(list) = comments.child_mut("commentList") {
+                list.children.retain(|n| {
+                    !matches!(n, XmlNode::Element(e)
+                        if e.local_name() == "comment"
+                            && e.attr_local("ref") == Some(ref_name.as_str()))
+                });
+            }
+            self.pkg.put_xml(&part, &comments)?;
+        }
+        if let Some(part) = find(VML_REL_TYPE) {
+            let mut vml = self.pkg.xml(&part)?;
+            let (row_s, col_s) = (row0.to_string(), col.to_string());
+            vml.children.retain(|n| {
+                !matches!(n, XmlNode::Element(e)
+                    if e.local_name() == "shape"
+                        && e.child("ClientData").map(|cd| {
+                            cd.child("Row").map(|r| r.text_content().trim() == row_s).unwrap_or(false)
+                                && cd.child("Column").map(|c| c.text_content().trim() == col_s).unwrap_or(false)
+                        }).unwrap_or(false))
+            });
+            self.pkg.put_xml(&part, &vml)?;
+        }
+        Ok(())
+    }
+
+    /// (cell_ref, author, text) of every comment on the sheet.
+    fn sheet_comments(&self, sheet: &Sheet) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let rels_part = sheet.part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels";
+        if !self.pkg.has_part(&rels_part) {
+            return out;
+        }
+        let Ok(rels) = self.pkg.xml(&rels_part) else { return out };
+        let Some(part) = rels
+            .children_named("Relationship")
+            .into_iter()
+            .find(|r| r.attr_local("Type") == Some(COMMENTS_REL_TYPE))
+            .and_then(|r| r.attr_local("Target"))
+            .map(|t| resolve_target("xl/worksheets", t))
+        else {
+            return out;
+        };
+        let Ok(comments) = self.pkg.xml(&part) else { return out };
+        let authors: Vec<String> = comments
+            .child("authors")
+            .map(|a| {
+                a.children_named("author")
+                    .iter()
+                    .map(|x| x.text_content())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(list) = comments.child("commentList") {
+            for c in list.children_named("comment") {
+                let cell = c.attr_local("ref").unwrap_or_default().to_string();
+                let author = c
+                    .attr_local("authorId")
+                    .and_then(|id| id.parse::<usize>().ok())
+                    .and_then(|id| authors.get(id).cloned())
+                    .unwrap_or_default();
+                let text = c.child("text").map(|t| t.text_content()).unwrap_or_default();
+                out.push((cell, author, text));
+            }
+        }
+        out
     }
 
     /// Replace a cell's text with its computed value when it's a formula.
@@ -1240,6 +1620,14 @@ fn load_shared_strings(pkg: &Package) -> Result<Vec<String>> {
 
 const EMPTY_RELS_XML: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
 
+const COMMENTS_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+const VML_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
+const COMMENTS_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
+const VML_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+
 /// Get-or-create a worksheet child at its schema-mandated position.
 fn worksheet_child<'a>(sheet_xml: &'a mut XmlElement, name: &str) -> &'a mut XmlElement {
     const ORDER: &[&str] = &[
@@ -1247,6 +1635,7 @@ fn worksheet_child<'a>(sheet_xml: &'a mut XmlElement, name: &str) -> &'a mut Xml
         "sheetCalcPr", "sheetProtection", "autoFilter", "sortState", "mergeCells",
         "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions",
         "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "drawing",
+        "legacyDrawing",
     ];
     if sheet_xml.child(name).is_none() {
         let rank = ORDER.iter().position(|o| *o == name).unwrap_or(ORDER.len());
@@ -1785,7 +2174,24 @@ impl Handler for Xlsx {
                 }
                 Ok(Report::Text(crate::html::page("Workbook", &out)))
             }
-            other => bail!("unknown view mode '{other}' for xlsx (text/outline/stats/html)"),
+            "comments" => {
+                let mut out = String::new();
+                let mut items = Vec::new();
+                for sheet in &self.sheets {
+                    for (cell, author, text) in self.sheet_comments(sheet) {
+                        out.push_str(&format!("{}!{} [{}] {}\n", sheet.name, cell, author, text));
+                        items.push(json!({
+                            "sheet": sheet.name, "cell": cell,
+                            "author": author, "text": text,
+                        }));
+                    }
+                }
+                if out.is_empty() {
+                    out = "(no comments)".into();
+                }
+                Ok(Report::Data { text: out, data: json!(items) })
+            }
+            other => bail!("unknown view mode '{other}' for xlsx (text/outline/stats/html/comments)"),
         }
     }
 
@@ -2358,9 +2764,10 @@ impl Handler for Xlsx {
         if !props.has("value")
             && !props.has("formula")
             && !props.has("url")
+            && !props.has("comment")
             && !StyleRequest::from_props(props)?.any()
         {
-            bail!("set on a cell needs --prop value=... , formula=... , url=... , or style props (bold/italic/color/size/fill/font/format)");
+            bail!("set on a cell needs --prop value=... , formula=... , url=... , comment=... , or style props (bold/italic/color/size/fill/font/format)");
         }
         let mut info = if props.has("value") || props.has("formula") || StyleRequest::from_props(props)?.any() {
             self.set_cell(sheet_idx, col, row0, props)?
@@ -2374,6 +2781,17 @@ impl Handler for Xlsx {
             let url = url.to_string();
             self.set_cell_hyperlink(sheet_idx, col, row0, &url)?;
             info.attr("url", url);
+        }
+        if let Some(comment) = props.get("comment") {
+            let comment = comment.to_string();
+            if comment.is_empty() {
+                self.remove_cell_comment(sheet_idx, col, row0)?;
+                info.attr("comment", "(removed)");
+            } else {
+                let author = props.get("author").unwrap_or("officecli").to_string();
+                self.set_cell_comment(sheet_idx, col, row0, &comment, &author)?;
+                info.attr("comment", comment);
+            }
         }
         Ok(Report::Nodes(vec![info]))
     }
@@ -2853,6 +3271,13 @@ impl Handler for Xlsx {
         let mut images = Vec::new();
         for sheet in &self.sheets {
             let ((c0, r0), (c1, r1)) = Self::used_range(sheet).unwrap_or(((0, 0), (7, 14)));
+            // Charts anchored on the sheet extend the rendered area.
+            let anchors = self.sheet_chart_anchors(sheet);
+            let (mut c1, mut r1) = (c1, r1);
+            for (_, _, tc, tr, _) in &anchors {
+                c1 = c1.max(*tc);
+                r1 = r1.max(*tr);
+            }
             let font_px = 14.0;
             let row_h = 26.0f32;
             let pad = 6.0f32;
@@ -2911,11 +3336,13 @@ impl Handler for Xlsx {
                             header_w + col_w[..(col - c0) as usize].iter().sum::<f32>();
                         let cy = row_h * (r - r0 + 1) as f32;
                         let cw = col_w[(col - c0) as usize];
-                        let (mut bold, mut color, mut fill) = (false, BLACK, None::<Color>);
+                        let (mut bold, mut italic, mut color, mut fill) =
+                            (false, false, BLACK, None::<Color>);
                         if let Some(s) = c.attr_local("s").and_then(|v| v.parse::<usize>().ok()) {
                             for (k, v) in style_props(&self.styles, s) {
                                 match k.as_str() {
                                     "bold" => bold = v == "true",
+                                    "italic" => italic = v == "true",
                                     "color" => color = Color::from_hex(&v).unwrap_or(BLACK),
                                     "fill" => fill = Color::from_hex(&v),
                                     _ => {}
@@ -2929,7 +3356,15 @@ impl Handler for Xlsx {
                         let numeric = text.parse::<f64>().is_ok() && !text.is_empty();
                         let tw = canvas.text_width(&text, font_px, bold);
                         let tx = if numeric { cx + cw - pad - tw } else { cx + pad };
-                        canvas.draw_text(&text, tx, cy + row_h - 8.0, font_px, color, bold);
+                        canvas.draw_text_styled(
+                            &text,
+                            tx,
+                            cy + row_h - 8.0,
+                            font_px,
+                            color,
+                            bold,
+                            italic,
+                        );
                     }
                 }
             }
@@ -2945,6 +3380,19 @@ impl Handler for Xlsx {
             for r in 0..=(r1 - r0 + 2) {
                 let y = row_h * r as f32;
                 canvas.line(0.0, y, width as f32, y, GRID);
+            }
+
+            // Charts drawn over the grid at their anchor rectangles.
+            for (fc, fr, tc, tr, space) in &anchors {
+                let col_x = |col: u32| -> f32 {
+                    let idx = (col.saturating_sub(c0) as usize).min(col_w.len());
+                    header_w + col_w[..idx].iter().sum::<f32>()
+                };
+                let x0 = col_x(*fc);
+                let x1 = col_x(*tc).max(x0 + 60.0);
+                let y0 = row_h * (fr.saturating_sub(r0) + 1) as f32;
+                let y1 = (row_h * (tr.saturating_sub(r0) + 1) as f32).max(y0 + 50.0);
+                crate::chartdraw::draw_chart(&mut canvas, space, x0, y0, x1 - x0, y1 - y0);
             }
             images.push(canvas.png()?);
         }
@@ -2965,6 +3413,12 @@ impl Handler for Xlsx {
                 ops.push(json!({
                     "command": "add", "parent": "/", "type": "sheet",
                     "props": { "name": sheet.name },
+                }));
+            }
+            for (cell, author, text) in self.sheet_comments(sheet) {
+                ops.push(json!({
+                    "command": "set", "path": format!("/{}/{}", sheet.name, cell),
+                    "props": { "comment": text, "author": author },
                 }));
             }
             let Some(sd) = sheet.xml.child("sheetData") else { continue };

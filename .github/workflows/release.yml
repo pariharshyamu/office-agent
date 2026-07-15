@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v0.4.0)"
+        description: "Release tag to create (e.g. v0.5.0)"
         required: true
-        default: "v0.4.0"
+        default: "v0.5.0"
 
 permissions:
   contents: write
@@ -111,9 +111,11 @@ jobs:
             dump, batch (--atomic), validate, watch, resident, mcp, help.
             Mutating commands accept --backup and --dry-run.
 
-            New in this line: a built-in formula evaluator (get --computed /
-            calc), xlsx sort + merged cells + column/row sizing, pptx tables,
-            docx headers/footers + page setup, and a diff command.
+            New in this line: scatter charts and docx inline charts, charts
+            with embedded editable workbooks (PowerPoint/Word "Edit Data"),
+            xlsx cell comments, chart rendering + JPEG/GIF decoding +
+            italics in screenshots, HSL-accurate theme colors, fly-in
+            animations, and SUMPRODUCT/TEXTJOIN/FLOOR/CEILING formulas.
 
             **Install (Linux/macOS):**
             ```sh

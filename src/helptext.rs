@@ -111,6 +111,10 @@ ADD
                      ("1-3"); Word populates it on open/update
   --type field       props: kind=page|numpages|date|time|filename|author
                      or code="..." (parent = a paragraph)
+  --type chart       props: kind=column|bar|line|pie|scatter,
+                     categories="Q1,Q2" (scatter: xvalues="1,2"),
+                     values="10,20", series=Name, values2=/series2=...,
+                     title, w/h; embeds an editable data workbook
   --type comment     props: text, author; attaches to a paragraph
   --type footnote    props: text; adds superscript reference + note
   --type header      props: text, align, page-numbers=true, format props;
@@ -161,6 +165,7 @@ SET (cells are created on demand)
   type=string|number|boolean|date|formula   forces interpretation
   format=date|datetime|time|percent|currency|integer|0.00|custom-code
   url=https://...     hyperlink (styled blue + underline)
+  comment="note" [author=Name]   cell comment (empty comment= removes it)
   bold, italic, underline, color, size, font, fill   cell styling
   Formulas are stored uncalculated; read results with get --computed or calc.
 
@@ -170,10 +175,11 @@ SET (range / column / row layout)
   officecli set data.xlsx '/Sheet1/row[1]' --prop height=28    # row height (points)
 
 FORMULAS (get --computed / calc)
-  ~40 functions: SUM AVERAGE MIN MAX COUNT COUNTA MEDIAN PRODUCT
-  IF IFERROR AND OR NOT  ROUND ROUNDUP ROUNDDOWN INT ABS MOD POWER SQRT
-  EXP LN LOG10  CONCAT LEFT RIGHT MID LEN UPPER LOWER TRIM SUBSTITUTE VALUE
-  SUMIF COUNTIF AVERAGEIF VLOOKUP INDEX MATCH  TODAY NOW DATE YEAR MONTH DAY
+  ~45 functions: SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK MEDIAN PRODUCT
+  SUMPRODUCT  IF IFERROR AND OR NOT  ROUND ROUNDUP ROUNDDOWN INT ABS MOD
+  POWER SQRT EXP LN LOG10 FLOOR CEILING  CONCAT LEFT RIGHT MID LEN UPPER
+  LOWER TRIM PROPER SUBSTITUTE TEXTJOIN VALUE  SUMIF COUNTIF AVERAGEIF
+  VLOOKUP INDEX MATCH  TODAY NOW DATE YEAR MONTH DAY
   Cross-sheet refs (Sheet2!A1), ranges, operators + - * / ^ & = <> < > <= >=,
   cycle detection (#CIRC!). Errors: #DIV/0! #REF! #NAME? #VALUE! #N/A
 
@@ -193,8 +199,9 @@ ADD
                  down from row 1), r1=..., r2=... ; cells shift right and
                  formula references follow
   --type chart   props: data=A1:C9 (first col = categories, first row =
-                 headers), kind=column|bar|line|pie, title, at=E2 (anchor
-                 cell), w/h (in cells); references live cells
+                 headers), kind=column|bar|line|pie|scatter (scatter:
+                 first col = x values), title, at=E2 (anchor cell),
+                 w/h (in cells); references live cells
   --type pivot   props: source=A1:C9, rows=Header, values=Header,
                  agg=sum|count|avg|min|max, name; writes a computed group-by
                  summary to a new sheet (static table, not an interactive
@@ -217,8 +224,8 @@ FIND / REPLACE
   officecli set data.xlsx / --find draft --replace final
   (string cells only; find+format is not supported for xlsx)
 
-VIEW  outline (sheets + ranges), text (grid), stats, html,
-      screenshot (-o grid.png; one PNG per sheet)"#;
+VIEW  outline (sheets + ranges), text (grid), stats, html, comments,
+      screenshot (-o grid.png; one PNG per sheet, charts drawn in place)"#;
 
 const PPTX: &str = r#"officecli pptx — PowerPoint presentations
 
@@ -236,10 +243,11 @@ ADD
                  url (hyperlink), list=bullet|number
                  '\n' in text starts a new paragraph; leading '\t' = level
   --type image   props: src=file.png or srcdata=BASE64, x, y, w, h
-  --type chart   props: kind=column|bar|line|pie, categories="Q1,Q2",
-                 values="10,20", series=Name, values2=/series2= for more
-                 series, title, x/y/w/h; data is embedded in the chart
-                 (PowerPoint renders it; Edit Data needs a linked workbook)
+  --type chart   props: kind=column|bar|line|pie|scatter (scatter takes
+                 xvalues="1,2,4"), categories="Q1,Q2", values="10,20",
+                 series=Name, values2=/series2= for more series, title,
+                 x/y/w/h; data is cached in the chart plus embedded as a
+                 real workbook, so PowerPoint's "Edit Data" opens a sheet
   --type table   props: data="a,b\nc,d" (CSV-shaped), or rows/cols for an
                  empty grid; header=true styles the first row; x/y/w/h.
                  Replace cells later with set --prop data=...
@@ -253,7 +261,8 @@ SET
                  [speed=slow|medium|fast or a duration] [advance=5s]
   shape          text (replaces content), x/y/w/h, fill, name, url, and
                  size/color/bold/italic/font/align applied to all runs
-                 animation=appear|fade|wipe (click-triggered entrance;
+                 animation=appear|fade|wipe|fly-in (click-triggered
+                 entrance; fly-in takes direction=left|right|top|bottom;
                  [duration=500ms] [delay=0ms])
 
 COPY  officecli copy deck.pptx '/slide[1]'   duplicate (content + notes)
